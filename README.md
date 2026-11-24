@@ -21,11 +21,6 @@ php artisan vendor:publish --tag=payments-config
 php artisan payments:seed-gateways         
 ```
 
-Local development before publishing, in the host app's `composer.json`:
-
-```json
-
-```
 then `composer require molefigog/laravel-payments:@dev`.
 
 Auto-discovery registers `PaymentsServiceProvider`. Nothing else to wire.
