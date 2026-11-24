@@ -20,9 +20,6 @@ php artisan migrate
 php artisan vendor:publish --tag=payments-config
 php artisan payments:seed-gateways         
 ```
-
-then `composer require molefigog/laravel-payments:@dev`.
-
 Auto-discovery registers `PaymentsServiceProvider`. Nothing else to wire.
 
 ## Configure
