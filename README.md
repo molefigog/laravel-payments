@@ -2,7 +2,7 @@
 
 One Laravel service provider for **M-Pesa (Vodacom LS), EcoCash (PayLesotho), Chaperone CPay and PayPal**.
 Your app only ever says *"charge this user for product 5 through gateway X"*. The package never
-knows what a product is, so the same code serves music, POS, OTT or anything else.
+knows what a product is, so the same code serves POS, OTT or anything else.
 
 - `product_id` only (string column, nullable). No product type, no `music_id` / `service_id`.
 - Server-side pricing through one small `ProductResolver` you write per project.
@@ -14,10 +14,10 @@ knows what a product is, so the same code serves music, POS, OTT or anything els
 ## Install
 
 ```bash
-composer require molefigog/laravel-payments      # after you push it to GitHub / Packagist
+composer require molefigog/laravel-payments
 php artisan migrate
-php artisan vendor:publish --tag=payments-config # optional
-php artisan payments:seed-gateways               # optional: rows for a management UI
+php artisan vendor:publish --tag=payments-config
+php artisan payments:seed-gateways         
 ```
 
 Local development before publishing, in the host app's `composer.json`:
@@ -46,7 +46,7 @@ Also set `PAYMENTS_RESULT_URL` (where the browser returns after PayPal / CPay ca
 A `payment_gateways` row with the same slug overrides config. Credentials in the DB are encrypted
 (`encrypted:array`). A slug may use any driver, e.g. `cpay-card` with `driver=cpay, settings.method=card`.
 
-## The only code you write per project: a resolver
+## Usage per project: a resolver
 
 ```php
 use Molefigog\Payments\Contracts\ProductResolver;
@@ -78,7 +78,7 @@ Without a resolver the package accepts a client `amount`; do that only for serve
 ## Use it
 
 ```php
-use Molefigog\Payments\Traits\HasPayments;   // on User
+use Molefigog\Payments\Traits\HasPayments;  
 
 $result = $user->charge([12, 15], 'mpesa', ['msisdn' => '58123456']);
 $result->status;     // pending | completed | failed
