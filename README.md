@@ -14,6 +14,7 @@ knows what a product is, so the same code serves POS, OTT or anything else.
 ## Install
 
 ```bash
+composer config repositories.laravel-payments vcs https://github.com/molefigog/laravel-payments
 composer require molefigog/laravel-payments
 php artisan migrate
 php artisan vendor:publish --tag=payments-config
@@ -23,7 +24,7 @@ php artisan payments:seed-gateways
 Local development before publishing, in the host app's `composer.json`:
 
 ```json
-"repositories": [{ "type": "path", "url": "../laravel-payments" }]
+
 ```
 then `composer require molefigog/laravel-payments:@dev`.
 
