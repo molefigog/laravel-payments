@@ -5,6 +5,7 @@ namespace Molefigog\Payments\Console;
 use Illuminate\Console\Command;
 use Molefigog\Payments\Models\Payment;
 use Molefigog\Payments\PaymentService;
+use Molefigog\Payments\Support\Models;
 
 class ReconcileCommand extends Command
 {
@@ -14,7 +15,7 @@ class ReconcileCommand extends Command
 
     public function handle(PaymentService $payments): int
     {
-        $references = Payment::query()
+        $references = Models::payment()::query()
             ->where('status', 'pending')
             ->where('created_at', '>=', now()->subMinutes((int) $this->option('minutes')))
             ->whereNotNull('reference')

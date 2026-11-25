@@ -4,6 +4,7 @@ namespace Molefigog\Payments\Console;
 
 use Illuminate\Console\Command;
 use Molefigog\Payments\Models\PaymentGateway;
+use Molefigog\Payments\Support\Models;
 
 class SeedGatewaysCommand extends Command
 {
@@ -16,7 +17,7 @@ class SeedGatewaysCommand extends Command
         $created = 0;
 
         foreach ((array) config('payments.gateways', []) as $slug => $cfg) {
-            $row = PaymentGateway::query()->firstOrCreate(['slug' => $slug], [
+            $row = Models::gateway()::query()->firstOrCreate(['slug' => $slug], [
                 'name' => $cfg['name'] ?? $slug,
                 'driver' => $cfg['driver'] ?? $slug,
                 'enabled' => (bool) ($cfg['enabled'] ?? true),

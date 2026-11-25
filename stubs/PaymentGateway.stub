@@ -1,0 +1,10 @@
+<?php
+
+namespace {{ rootNamespace }}Models;
+
+use Molefigog\Payments\Models\PaymentGateway as BasePaymentGateway;
+
+/** Your gateway model (e.g. to manage gateways from your admin panel). Registered in config/payments.php ('models'). */
+class PaymentGateway extends BasePaymentGateway
+{
+}

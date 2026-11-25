@@ -1,0 +1,3267 @@
+From 31d60e0125df5827652a32dc16c23236076b9d6b Mon Sep 17 00:00:00 2001
+From: laravel-payments <noreply@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 13:05:25 +0000
+Subject: [PATCH] Add installer, swappable models and frontend layers (JS core,
+ Vue/Quasar, Blade)
+
+- payments:install: tick what to publish (config, migrations, model/listener/resolver stubs, Vue/Quasar, Blade)
+- payments.models config: extend Payment/PaymentGateway in the app instead of copying them
+- Headless JS core (state machine) with Vue 3/Quasar composable + PaymentDialog and a Blade checkout component
+- Tests (PHP pure-logic + installer, JS core/dialog/blade) and GitHub Actions CI
+---
+ .github/workflows/ci.yml                      |  40 ++
+ .gitignore                                    |   5 +
+ README.md                                     |  80 ++-
+ config/payments.php                           |   7 +
+ package-lock.json                             | 657 ++++++++++++++++++
+ package.json                                  |  15 +
+ resources/dist/payments-blade.js              | 184 +++++
+ resources/dist/payments-core.global.js        | 255 +++++++
+ resources/js/core/payments-core.js            | 250 +++++++
+ resources/js/vue/PaymentDialog.vue            | 222 ++++++
+ resources/js/vue/usePayment.js                |  38 +
+ .../components/payments/checkout.blade.php    |  67 ++
+ scripts/build-global.mjs                      |  15 +
+ src/Console/InstallCommand.php                | 245 +++++++
+ src/Console/ReconcileCommand.php              |   3 +-
+ src/Console/SeedGatewaysCommand.php           |   3 +-
+ src/GatewayManager.php                        |   5 +-
+ src/PaymentService.php                        |  13 +-
+ src/PaymentsServiceProvider.php               |  14 +-
+ src/Support/Models.php                        |  25 +
+ src/Support/StubPublisher.php                 |  73 ++
+ src/Traits/HasPayments.php                    |   3 +-
+ stubs/AppProductResolver.stub                 |  28 +
+ stubs/HandlePaymentCompleted.stub             |  24 +
+ stubs/Payment.stub                            |  18 +
+ stubs/PaymentGateway.stub                     |  10 +
+ tests-js/blade.test.mjs                       | 126 ++++
+ tests-js/core.test.mjs                        | 202 ++++++
+ tests-js/dialog.test.mjs                      | 115 +++
+ tests/publisher.php                           |  59 ++
+ tests/smoke.php                               |  70 ++
+ 31 files changed, 2846 insertions(+), 25 deletions(-)
+ create mode 100644 .github/workflows/ci.yml
+ create mode 100644 .gitignore
+ create mode 100644 package-lock.json
+ create mode 100644 package.json
+ create mode 100644 resources/dist/payments-blade.js
+ create mode 100644 resources/dist/payments-core.global.js
+ create mode 100644 resources/js/core/payments-core.js
+ create mode 100644 resources/js/vue/PaymentDialog.vue
+ create mode 100644 resources/js/vue/usePayment.js
+ create mode 100644 resources/views/components/payments/checkout.blade.php
+ create mode 100644 scripts/build-global.mjs
+ create mode 100644 src/Console/InstallCommand.php
+ create mode 100644 src/Support/Models.php
+ create mode 100644 src/Support/StubPublisher.php
+ create mode 100644 stubs/AppProductResolver.stub
+ create mode 100644 stubs/HandlePaymentCompleted.stub
+ create mode 100644 stubs/Payment.stub
+ create mode 100644 stubs/PaymentGateway.stub
+ create mode 100644 tests-js/blade.test.mjs
+ create mode 100644 tests-js/core.test.mjs
+ create mode 100644 tests-js/dialog.test.mjs
+ create mode 100644 tests/publisher.php
+ create mode 100644 tests/smoke.php
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index 0000000..0985d1d
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,40 @@
++name: CI
++
++on:
++  push:
++    branches: [main]
++  pull_request:
++
++jobs:
++  php:
++    runs-on: ubuntu-latest
++    strategy:
++      matrix:
++        php: ['8.2', '8.3', '8.4']
++    steps:
++      - uses: actions/checkout@v4
++      - uses: shivammathur/setup-php@v2
++        with:
++          php-version: ${{ matrix.php }}
++          extensions: openssl, json, mbstring
++      - name: Syntax check
++        run: find src config database routes -name '*.php' -print0 | xargs -0 -n1 php -l
++      - name: Pure-logic checks
++        run: php tests/smoke.php
++      - name: Installer building blocks and stubs
++        run: php tests/publisher.php
++
++  js:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-node@v4
++        with:
++          node-version: 22
++          cache: npm
++      - run: npm ci
++      - run: npm test
++      - name: Global bundle is up to date
++        run: |
++          npm run build
++          git diff --exit-code resources/dist
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..b3f7469
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,5 @@
++/vendor
++/node_modules
++/.tmp-ui
++composer.lock
++.phpunit.result.cache
+diff --git a/README.md b/README.md
+index cd92071..4a26966 100644
+--- a/README.md
++++ b/README.md
+@@ -22,6 +22,27 @@ php artisan payments:seed-gateways
+ ```
+ Auto-discovery registers `PaymentsServiceProvider`. Nothing else to wire.
+ 
++### Choose what to publish
++
++```bash
++php artisan payments:install
++```
++
++Tick what you want (re-run any time; existing files are never overwritten without `--force`):
++
++```
++ [x] Config                 config/payments.php
++ [x] Migrations             copied into database/migrations
++ [ ] Model stubs            App\Models\Payment, PaymentGateway (extend the package models)
++ [ ] Listener stub          runs when a payment completes
++ [ ] Product resolver stub  server-side pricing
++ [ ] Vue 3 / Quasar         usePayment() + PaymentDialog
++ [ ] Blade                  <x-payments.checkout> (also fine inside Livewire pages)
++```
++
++Non-interactive: `payments:install --config --migrations --models --vue --vue-path=../my-quasar-app/src/payments`
++or `--all`. Payment logic (gateways, service) is never copied: it stays in `vendor/` so you keep getting fixes.
++
+ ## Configure
+ 
+ Gateways read the same env names Musik already uses:
+@@ -93,6 +114,31 @@ What the client does next, from `action`: `poll` → call `status/{reference}` e
+ (M-Pesa, EcoCash) · `otp` → collect OTP, call `confirm` (CPay mobile) · `redirect` / `html` → send the
+ browser to `redirect_url` / render `html` (PayPal, CPay card).
+ 
++## Frontend: one core, thin wrappers
++
++All UIs sit on one framework-free state machine (`resources/js/core/payments-core.js`):
++`idle → charging → otp | polling | redirecting | html → success | failed | timeout`.
++It does the charging, polling, OTP and redirect handling from the API's `action` field, so a new UI is a view only.
++
++**Vue 3 / Quasar** (your Quasar app can be a separate project: use `--vue-path`):
++
++```vue
++<PaymentDialog v-model="open" :product-ids="[song.id]" :headers="() => ({ Authorization: `Bearer ${token}` })"
++               @success="onPaid" />
++```
++or headless: `const { state, start, confirmOtp } = usePayment({ baseUrl: '/api/payments', headers })`.
++
++**Blade** (needs no bundler):
++
++```blade
++<x-payments.checkout :product-ids="[$song->id]" label="Buy now" :gateways="['mpesa','ecocash']" />
++```
++It fires `payments:success` / `payments:failed` DOM events, sends the CSRF header, and resumes automatically when the
++browser returns with `?reference=...` (PayPal, CPay card). For a session-auth app set
++`'routes' => ['middleware' => ['web'], 'auth_middleware' => ['auth']]` in `config/payments.php`.
++
++Both are *yours* once published: restyle freely.
++
+ ## Your logic goes in listeners
+ 
+ ```php
+@@ -111,6 +157,8 @@ Events: `PaymentInitiated`, `PaymentCompleted`, `PaymentFailed`. Each fires once
+ 1. Install; `php artisan migrate`. The migrations **adopt** your existing `payments` and
+    `payment_gateways` tables (adds columns, backfills `gateway ← type`, `product_id ← music_id/service_id`,
+    `payee_id ← seller_id`, `reference ← txn_id`). Old columns stay until you drop them.
++   `payments:install --models` will warn that `App\Models\Payment` already exists: make your model `extend
++   Molefigog\Payments\Models\Payment`, then set `payments.models.payment` to it.
+ 2. Write the resolver above. Services with no id: return a `Product` with your own id scheme (e.g. `service:beat`).
+ 3. Move `TaskProvisioningService`, `CreditSellerForPayment` and `SendPaymentInvoice::dispatchFor` into a `PaymentCompleted` listener.
+ 4. Point the Quasar app at the new routes, then delete `PaymentsController`, `CpayService`, `PayPalService`,
+@@ -129,21 +177,27 @@ Events: `PaymentInitiated`, `PaymentCompleted`, `PaymentFailed`. Each fires once
+ 
+ - **Polling** needs a real queue (`database`, `redis`). With `QUEUE_CONNECTION=sync` it is skipped and clients poll `status/{reference}`.
+ - `php artisan payments:reconcile` re-checks payments still pending; schedule it every few minutes.
++- **Use your own models:** `payments:install --models` creates `App\Models\Payment` / `PaymentGateway` extending the
++  package ones and points `payments.models` at them. Add relations, scopes and casts there.
++- **Develop / test:** `php tests/smoke.php && php tests/publisher.php`, and `npm install && npm test` for the frontend
++  (CI runs all of it). After editing `resources/js/core`, run `npm run build` to refresh `resources/dist`.
+ - Add a gateway: implement `Contracts\PaymentGateway` (extend `Gateways\AbstractGateway`), then
+   `app(GatewayManager::class)->extend('mydriver', MyGateway::class)` or add it under `payments.drivers`.
+ 
+-## Honest status (v0.1)
+-
+-- Syntax-checked on PHP 8.3 and the pure logic (MSISDN formats, redirect allow-list, amount splitting,
+-  resolver pricing, M-Pesa key encryption) is smoke-tested. **It has not been run against live or sandbox
+-  provider APIs, or inside a Laravel app.** Test each gateway in sandbox before production.
+-- Gateway calls are ported from the working Musik code. Behaviour changes you should know about:
+-  PayPal counts only `COMPLETED` captures (not `APPROVED`) and checks the captured amount; EcoCash keeps
+-  polling instead of failing on the first unsuccessful verify (times out after 180 s); the CPay and
+-  M-Pesa references are generated by the package; the CPay callback is unsigned in the original
+-  integration, so ask Chaperone whether a signature exists. CPay's transaction-status response format
+-  is undocumented in the old code, so `status()` only treats `TransactionComplete` as success.
+-- Not included yet: the Filament management page (the models and tables are ready for it),
+-  tests with Orchestra Testbench, and a JS/Quasar client.
++## Honest status (v0.2, pre-release)
++
++- **Verified:** PHP syntax on 8.3; pure logic (MSISDN formats, redirect allow-list, amount splitting, resolver pricing,
++  M-Pesa key encryption, installer file handling); the JS core (17 scenarios against a mock API); the Quasar dialog and the
++  Blade dialog driven through full flows in a simulated browser (jsdom, Quasar components stubbed).
++- **Not yet verified:** the package inside a real Laravel app; any gateway against its live or sandbox API; the real
++  Quasar components in a browser; the Blade template compiled by Laravel; `payments:install` run in an app.
++  Test each gateway in sandbox before production.
++- Gateway calls are ported from working Musik code. Behaviour changes to know about: PayPal counts only `COMPLETED`
++  captures and checks the captured amount; EcoCash keeps polling instead of failing on the first unsuccessful verify
++  (times out after 180 s); CPay and M-Pesa references are generated by the package; the CPay callback is unsigned in the
++  original integration (ask Chaperone about a signature); CPay's status response is undocumented, so only
++  `TransactionComplete` counts as success.
++- Not included yet: Livewire and React wrappers, a Filament management page (models and tables are ready), Orchestra
++  Testbench tests.
+ 
+ MIT
+diff --git a/config/payments.php b/config/payments.php
+index c57af1f..a138f23 100644
+--- a/config/payments.php
++++ b/config/payments.php
+@@ -27,6 +27,13 @@ return [
+         'gateways' => 'payment_gateways',
+     ],
+ 
++    // Swap in your own models (they must extend the package ones). `php artisan payments:install`
++    // can create App\Models\Payment / PaymentGateway stubs for you.
++    'models' => [
++        'payment' => Molefigog\Payments\Models\Payment::class,
++        'gateway' => Molefigog\Payments\Models\PaymentGateway::class,
++    ],
++
+     'routes' => [
+         'enabled' => true,
+         'prefix' => 'api/payments',
+diff --git a/package-lock.json b/package-lock.json
+new file mode 100644
+index 0000000..a5d79da
+--- /dev/null
++++ b/package-lock.json
+@@ -0,0 +1,657 @@
++{
++  "name": "laravel-payments-dev",
++  "lockfileVersion": 3,
++  "requires": true,
++  "packages": {
++    "": {
++      "name": "laravel-payments-dev",
++      "devDependencies": {
++        "@vue/compiler-sfc": "^3.5.46",
++        "jsdom": "^31.0.1",
++        "vue": "^3.5.46"
++      }
++    },
++    "node_modules/@babel/helper-string-parser": {
++      "version": "7.29.15",
++      "resolved": "https://registry.npmjs.org/@babel/helper-string-parser/-/helper-string-parser-7.29.15.tgz",
++      "integrity": "sha512-C2FuapQ2Kh1OnVHAoLi5rD3GBJ8COb9Q609T6HEpLqaBAo560PDP5OxBE5dCI/h951MBO/+bCUYU5SZ+8ZlV+w==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=6.9.0"
++      }
++    },
++    "node_modules/@babel/helper-validator-identifier": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/helper-validator-identifier/-/helper-validator-identifier-7.29.7.tgz",
++      "integrity": "sha512-qehxGkRj55h/ff8EMaJ+cYhyaKlHIxqYDn682wQD7RNp9UujOQsHog2uS0r2vzr4pW+sXf90NeeayjcNaX3fFg==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=6.9.0"
++      }
++    },
++    "node_modules/@babel/parser": {
++      "version": "7.29.15",
++      "resolved": "https://registry.npmjs.org/@babel/parser/-/parser-7.29.15.tgz",
++      "integrity": "sha512-RpKWyisHoP81twtSCgmE02iU0RnPcq1DN5bBEbpUePrjA9Q3wXhufnCJrrayPpoZieqFh3zyZQqwtSK0gGccRA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@babel/types": "^7.29.15"
++      },
++      "bin": {
++        "parser": "bin/babel-parser.js"
++      },
++      "engines": {
++        "node": ">=6.0.0"
++      }
++    },
++    "node_modules/@babel/types": {
++      "version": "7.29.15",
++      "resolved": "https://registry.npmjs.org/@babel/types/-/types-7.29.15.tgz",
++      "integrity": "sha512-/XKpKDakL//LZ66bq1XsZOswuqeI5MZqPLDu18o3XdkU1fNJ7bdPtzgnc4ZNS+bBGHV0FJG8jjb8SwcC3nNVQQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@babel/helper-string-parser": "^7.29.15",
++        "@babel/helper-validator-identifier": "^7.29.7"
++      },
++      "engines": {
++        "node": ">=6.9.0"
++      }
++    },
++    "node_modules/@exodus/bytes": {
++      "version": "1.16.0",
++      "resolved": "https://registry.npmjs.org/@exodus/bytes/-/bytes-1.16.0.tgz",
++      "integrity": "sha512-IcpW84uEn3N7ETtNZMlxKhfl6Pec8rUNGOTBtWbK1FKhJxIFAptZyVrvVRVBimAJxJCgc3PxepxkdWWG4DVzfA==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": "^20.19.0 || ^22.12.0 || >=24.0.0"
++      },
++      "peerDependencies": {
++        "@noble/hashes": "^1.8.0 || ^2.0.0"
++      },
++      "peerDependenciesMeta": {
++        "@noble/hashes": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/@jridgewell/sourcemap-codec": {
++      "version": "1.6.0",
++      "resolved": "https://registry.npmjs.org/@jridgewell/sourcemap-codec/-/sourcemap-codec-1.6.0.tgz",
++      "integrity": "sha512-T7jf+5zgsZHwNJ4lvQ7/aezbyk0nNX+zJVWpmHA7VYsEx7a7qr5Rg5IbtJFqkgze5Y2sruq1RUY8Q837Od7iFw==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@vue/compiler-core": {
++      "version": "3.5.46",
++      "resolved": "https://registry.npmjs.org/@vue/compiler-core/-/compiler-core-3.5.46.tgz",
++      "integrity": "sha512-yb+N8/mgBcoeqCJPVyJI/D3OphLrSMXnB3ZQUNmRLU/1fsMW4bFfdJWNi9oIj7+EA3ULKKkP7b/VCpcYQYeiuQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@babel/parser": "^7.29.12",
++        "@vue/shared": "3.5.46",
++        "entities": "^7.0.1",
++        "estree-walker": "^2.0.2",
++        "source-map-js": "^1.2.3"
++      }
++    },
++    "node_modules/@vue/compiler-dom": {
++      "version": "3.5.46",
++      "resolved": "https://registry.npmjs.org/@vue/compiler-dom/-/compiler-dom-3.5.46.tgz",
++      "integrity": "sha512-Bj3lCSw3DQnDRDxw115XqdLDd0+18Nftlgd8OXSGG+ud74hxJIE17eYrM+VWgQrTMsvJbLh9Hzf2MkwAzru36Q==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@vue/compiler-core": "3.5.46",
++        "@vue/shared": "3.5.46"
++      }
++    },
++    "node_modules/@vue/compiler-sfc": {
++      "version": "3.5.46",
++      "resolved": "https://registry.npmjs.org/@vue/compiler-sfc/-/compiler-sfc-3.5.46.tgz",
++      "integrity": "sha512-hjUvMxGh+QIgegwksfp6BRBYleE/a8veZHvTR6sa+o+bM4HU+WnrUZlhN0X+pDcsl8Lhwmbu72xPvLMk3XUwog==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@babel/parser": "^7.29.12",
++        "@vue/compiler-core": "3.5.46",
++        "@vue/compiler-dom": "3.5.46",
++        "@vue/compiler-ssr": "3.5.46",
++        "@vue/shared": "3.5.46",
++        "estree-walker": "^2.0.2",
++        "magic-string": "^0.30.21",
++        "postcss": "^8.5.32",
++        "source-map-js": "^1.2.3"
++      }
++    },
++    "node_modules/@vue/compiler-ssr": {
++      "version": "3.5.46",
++      "resolved": "https://registry.npmjs.org/@vue/compiler-ssr/-/compiler-ssr-3.5.46.tgz",
++      "integrity": "sha512-qebChL3aP0m1k+TlSf+fZWvOwAf3flBCi5o+n01ykR3DX4mTIWheFltmoiQ12+z66/4cGeXqbB2P7sPWkGhQNQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@vue/compiler-dom": "3.5.46",
++        "@vue/shared": "3.5.46"
++      }
++    },
++    "node_modules/@vue/reactivity": {
++      "version": "3.5.46",
++      "resolved": "https://registry.npmjs.org/@vue/reactivity/-/reactivity-3.5.46.tgz",
++      "integrity": "sha512-+FHtYTvGxgFoX3oRs7soz6JHizGv50Q26WJN6PWtXuTLXRfkfUpDUTRuoTA/kiZVVt8NMeMpsPQLh9h++ReUjQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@vue/shared": "3.5.46"
++      }
++    },
++    "node_modules/@vue/runtime-core": {
++      "version": "3.5.46",
++      "resolved": "https://registry.npmjs.org/@vue/runtime-core/-/runtime-core-3.5.46.tgz",
++      "integrity": "sha512-eJUzKAUaHAmtnys/l9qduPzUnBrYMkmsCU7TN+vbSOSpm8kcETT7nacKxIO4MBej/XiOraVzq+lSeZv7o1//jQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@vue/reactivity": "3.5.46",
++        "@vue/shared": "3.5.46"
++      }
++    },
++    "node_modules/@vue/runtime-dom": {
++      "version": "3.5.46",
++      "resolved": "https://registry.npmjs.org/@vue/runtime-dom/-/runtime-dom-3.5.46.tgz",
++      "integrity": "sha512-6L7lbBvXTYBFFjIt25a0pgdpmn3Ns8RqUnNVibRzF4bgyiWJvqOhKEV5MXYWKlCttZE3aGeJN8mveo+6IrIKXA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@vue/reactivity": "3.5.46",
++        "@vue/runtime-core": "3.5.46",
++        "@vue/shared": "3.5.46",
++        "csstype": "^3.2.4"
++      }
++    },
++    "node_modules/@vue/server-renderer": {
++      "version": "3.5.46",
++      "resolved": "https://registry.npmjs.org/@vue/server-renderer/-/server-renderer-3.5.46.tgz",
++      "integrity": "sha512-4mc0YWREc6OZ5pDCigvKPDzIUV+aciiH92yvyTS6xaHHxW/80rMceQQn11pYe7OEEBt2YQgYWR9zF8QF30GJUQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@vue/compiler-ssr": "3.5.46",
++        "@vue/runtime-dom": "3.5.46",
++        "@vue/shared": "3.5.46"
++      }
++    },
++    "node_modules/@vue/shared": {
++      "version": "3.5.46",
++      "resolved": "https://registry.npmjs.org/@vue/shared/-/shared-3.5.46.tgz",
++      "integrity": "sha512-P1WePbdzHrcIciWtmY2Im9EFhdakd3rZxYqvalOa3SfoxtF35Q8Uhmj1tKn6bWP4utcOpN8ao6BoJUItq0Uf+g==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/bcp-47": {
++      "version": "2.1.2",
++      "resolved": "https://registry.npmjs.org/bcp-47/-/bcp-47-2.1.2.tgz",
++      "integrity": "sha512-wsv86UuNFuPnVieKLyECTT+CP1WSAHeoIg5P3xu2kA9Z+7fVPoKt7dxzSeEhtJel0AI+NW3fIW3KtTKQKUCngg==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "is-alphabetical": "^2.0.0",
++        "is-alphanumerical": "^2.0.0",
++        "is-decimal": "^2.0.0"
++      },
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/wooorm"
++      }
++    },
++    "node_modules/bcp-47-match": {
++      "version": "2.0.3",
++      "resolved": "https://registry.npmjs.org/bcp-47-match/-/bcp-47-match-2.0.3.tgz",
++      "integrity": "sha512-JtTezzbAibu8G0R9op9zb3vcWZd9JF6M0xOYGPn0fNCd7wOpRB1mU2mH9T8gaBGbAAyIIVgB2G7xG0GP98zMAQ==",
++      "dev": true,
++      "license": "MIT",
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/wooorm"
++      }
++    },
++    "node_modules/csstype": {
++      "version": "3.2.4",
++      "resolved": "https://registry.npmjs.org/csstype/-/csstype-3.2.4.tgz",
++      "integrity": "sha512-PoKaoPzQapnEoqUSnHx1u6W6ku8CVEgKsnpmmzU3m1nwkidpPBQ8V/Zq2+bWNrsOKoKLwTGdbx6xF7BXP1zLVQ==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/data-urls": {
++      "version": "8.0.0",
++      "resolved": "https://registry.npmjs.org/data-urls/-/data-urls-8.0.0.tgz",
++      "integrity": "sha512-JQUCCK+/CAGbGGx618PlFZMXH81Jtj7t73CHv9dd/zVWvxgGT2zLFRjnKb+Ng46GIwcy+f7f88qd4duqllK+WQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "whatwg-mimetype": "^5.0.0",
++        "whatwg-url": "^17.1.2"
++      },
++      "engines": {
++        "node": "^22.14.0 || >=24.0.0"
++      }
++    },
++    "node_modules/decimal.js": {
++      "version": "10.6.0",
++      "resolved": "https://registry.npmjs.org/decimal.js/-/decimal.js-10.6.0.tgz",
++      "integrity": "sha512-YpgQiITW3JXGntzdUmyUR1V812Hn8T1YVXhCu+wO3OpS4eU9l4YdD3qjyiKdV6mvV29zapkMeD390UVEf2lkUg==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/entities": {
++      "version": "7.0.1",
++      "resolved": "https://registry.npmjs.org/entities/-/entities-7.0.1.tgz",
++      "integrity": "sha512-TWrgLOFUQTH994YUyl1yT4uyavY5nNB5muff+RtWaqNVCAK408b5ZnnbNAUEWLTCpum9w6arT70i1XdQ4UeOPA==",
++      "dev": true,
++      "license": "BSD-2-Clause",
++      "engines": {
++        "node": ">=0.12"
++      },
++      "funding": {
++        "url": "https://github.com/fb55/entities?sponsor=1"
++      }
++    },
++    "node_modules/estree-walker": {
++      "version": "2.0.2",
++      "resolved": "https://registry.npmjs.org/estree-walker/-/estree-walker-2.0.2.tgz",
++      "integrity": "sha512-Rfkk/Mp/DL7JVje3u18FxFujQlTNR2q6QfMSMB7AvCBx91NGj/ba3kCfza0f6dVDbw7YlRf/nDrn7pQrCCyQ/w==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/html-encoding-sniffer": {
++      "version": "7.0.0",
++      "resolved": "https://registry.npmjs.org/html-encoding-sniffer/-/html-encoding-sniffer-7.0.0.tgz",
++      "integrity": "sha512-UikN5yr7xsCDAq87Or5or0PAlD3HJJOKVzM05az588WnpDJ4Ux7a2A53Qi6gofGg2/EtvF/H4hCi/TXfCW4Y6w==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@exodus/bytes": "^1.15.1"
++      },
++      "engines": {
++        "node": "^22.13.0 || >=24.0.0"
++      }
++    },
++    "node_modules/is-alphabetical": {
++      "version": "2.0.1",
++      "resolved": "https://registry.npmjs.org/is-alphabetical/-/is-alphabetical-2.0.1.tgz",
++      "integrity": "sha512-FWyyY60MeTNyeSRpkM2Iry0G9hpr7/9kD40mD/cGQEuilcZYS4okz8SN2Q6rLCJ8gbCt6fN+rC+6tMGS99LaxQ==",
++      "dev": true,
++      "license": "MIT",
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/wooorm"
++      }
++    },
++    "node_modules/is-alphanumerical": {
++      "version": "2.0.1",
++      "resolved": "https://registry.npmjs.org/is-alphanumerical/-/is-alphanumerical-2.0.1.tgz",
++      "integrity": "sha512-hmbYhX/9MUMF5uh7tOXyK/n0ZvWpad5caBA17GsC6vyuCqaWliRG5K1qS9inmUhEMaOBIW7/whAnSwveW/LtZw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "is-alphabetical": "^2.0.0",
++        "is-decimal": "^2.0.0"
++      },
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/wooorm"
++      }
++    },
++    "node_modules/is-decimal": {
++      "version": "2.0.1",
++      "resolved": "https://registry.npmjs.org/is-decimal/-/is-decimal-2.0.1.tgz",
++      "integrity": "sha512-AAB9hiomQs5DXWcRB1rqsxGUstbRroFOPPVAomNk/3XHR5JyEZChOyTWe2oayKnsSsr/kcGqF+z6yuH6HHpN0A==",
++      "dev": true,
++      "license": "MIT",
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/wooorm"
++      }
++    },
++    "node_modules/is-potential-custom-element-name": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/is-potential-custom-element-name/-/is-potential-custom-element-name-1.0.1.tgz",
++      "integrity": "sha512-bCYeRA2rVibKZd+s2625gGnGF/t7DSqDs4dP7CrLA1m7jKWz6pps0LpYLJN8Q64HtmPKJ1hrN3nzPNKFEKOUiQ==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/jsdom": {
++      "version": "31.0.1",
++      "resolved": "https://registry.npmjs.org/jsdom/-/jsdom-31.0.1.tgz",
++      "integrity": "sha512-CbhJL8ZQg3eKswxSZth4QO9tW0jPIhmR0vtSXQSbKSfWbwIT6hoRc17wdHIVTQ43KI0mdV5iTJr3281IDgVZ5g==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@exodus/bytes": "^1.16.0",
++        "bcp-47": "^2.1.2",
++        "bcp-47-match": "^2.0.3",
++        "data-urls": "^8.0.0",
++        "decimal.js": "^10.6.0",
++        "html-encoding-sniffer": "^7.0.0",
++        "is-potential-custom-element-name": "^1.0.1",
++        "lru-cache": "^11.5.3",
++        "parse5": "^8.1.0",
++        "parse5-parser-stream": "^8.1.0",
++        "saxes": "^6.0.0",
++        "tough-cookie": "^6.0.2",
++        "undici": "^8.12.3",
++        "w3c-xmlserializer": "^6.0.0",
++        "webidl-conversions": "^8.0.1",
++        "whatwg-mimetype": "^5.0.0",
++        "whatwg-url": "^17.3.0",
++        "xml-name-validator": "^5.0.0"
++      },
++      "engines": {
++        "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
++      },
++      "peerDependencies": {
++        "@napi-rs/canvas": "^1.0.13"
++      },
++      "peerDependenciesMeta": {
++        "@napi-rs/canvas": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/lru-cache": {
++      "version": "11.5.3",
++      "resolved": "https://registry.npmjs.org/lru-cache/-/lru-cache-11.5.3.tgz",
++      "integrity": "sha512-U4N8FgzmWxc8k1VH8Kr6lQg18U7Fjvby6wXHVRX/ZZ7IwWbRMgrRbP0Wrb5q5NVinryp4SQampHKdvtecItxUg==",
++      "dev": true,
++      "license": "BlueOak-1.0.0",
++      "engines": {
++        "node": "20 || >=22"
++      }
++    },
++    "node_modules/magic-string": {
++      "version": "0.30.21",
++      "resolved": "https://registry.npmjs.org/magic-string/-/magic-string-0.30.21.tgz",
++      "integrity": "sha512-vd2F4YUyEXKGcLHoq+TEyCjxueSeHnFxyyjNp80yg0XV4vUhnDer/lvvlqM/arB5bXQN5K2/3oinyCRyx8T2CQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@jridgewell/sourcemap-codec": "^1.5.5"
++      }
++    },
++    "node_modules/nanoid": {
++      "version": "3.3.20",
++      "resolved": "https://registry.npmjs.org/nanoid/-/nanoid-3.3.20.tgz",
++      "integrity": "sha512-uKdg2G3GNCKQn9byYOpxbGqrT2fGO5KRt5J/8b3pok8rT6qxGWF6hxMyJiEYtAf+FVyYuD9hRaDqX5uPFYJ4ZQ==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "bin": {
++        "nanoid": "bin/nanoid.cjs"
++      },
++      "engines": {
++        "node": "^10 || ^12 || ^13.7 || ^14 || >=15.0.1"
++      }
++    },
++    "node_modules/parse5": {
++      "version": "8.1.1",
++      "resolved": "https://registry.npmjs.org/parse5/-/parse5-8.1.1.tgz",
++      "integrity": "sha512-EcR/6WDcU7b2N3vQSxKALCk9lXGtUMQxXio008OEMBE0kavu/7JLfBEeFPzi43nMqVDSbEn3QCK+BMCc9zO//w==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "entities": "^9.0.0"
++      },
++      "funding": {
++        "url": "https://github.com/inikulin/parse5?sponsor=1"
++      }
++    },
++    "node_modules/parse5-parser-stream": {
++      "version": "8.1.1",
++      "resolved": "https://registry.npmjs.org/parse5-parser-stream/-/parse5-parser-stream-8.1.1.tgz",
++      "integrity": "sha512-hMcVbbUJcQmP8rURWUdYrT1flRiBiBVjq/RYGguJpDUgIXSqdYKlE0CxthmdMWoSlBAuL5bUBa73g0pttSy7Hw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "parse5": "^8.1.1"
++      },
++      "funding": {
++        "url": "https://github.com/inikulin/parse5?sponsor=1"
++      }
++    },
++    "node_modules/parse5/node_modules/entities": {
++      "version": "9.0.0",
++      "resolved": "https://registry.npmjs.org/entities/-/entities-9.0.0.tgz",
++      "integrity": "sha512-oJFNDJg3kTPwAD1cNn2+WmUq4wFoo09npc3Ydf1D7ED4smRiWrsKnaLxykrTWgyGEcusc87P5dxlAleol9kpkg==",
++      "dev": true,
++      "license": "BSD-2-Clause",
++      "engines": {
++        "node": ">=20.19.0"
++      },
++      "funding": {
++        "url": "https://github.com/fb55/entities?sponsor=1"
++      }
++    },
++    "node_modules/picocolors": {
++      "version": "1.1.1",
++      "resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.1.tgz",
++      "integrity": "sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA==",
++      "dev": true,
++      "license": "ISC"
++    },
++    "node_modules/postcss": {
++      "version": "8.5.33",
++      "resolved": "https://registry.npmjs.org/postcss/-/postcss-8.5.33.tgz",
++      "integrity": "sha512-RVHEU9/Pp1Fnjr/MpAJsZoADukCKhfIi15OunEYiGktIkYLkPVvC1sioWolGDS7XByMTx9m/IGbro0Js13zhnQ==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/postcss/"
++        },
++        {
++          "type": "tidelift",
++          "url": "https://tidelift.com/funding/github/npm/postcss"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "nanoid": "^3.3.20",
++        "picocolors": "^1.1.1",
++        "source-map-js": "^1.2.2"
++      },
++      "engines": {
++        "node": "^10 || ^12 || >=14"
++      }
++    },
++    "node_modules/punycode": {
++      "version": "2.3.1",
++      "resolved": "https://registry.npmjs.org/punycode/-/punycode-2.3.1.tgz",
++      "integrity": "sha512-vYt7UD1U9Wg6138shLtLOvdAu+8DsC/ilFtEVHcH+wydcSpNE20AfSOduf6MkRFahL5FY7X1oU7nKVZFtfq8Fg==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=6"
++      }
++    },
++    "node_modules/saxes": {
++      "version": "6.0.0",
++      "resolved": "https://registry.npmjs.org/saxes/-/saxes-6.0.0.tgz",
++      "integrity": "sha512-xAg7SOnEhrm5zI3puOOKyy1OMcMlIJZYNJY7xLBwSze0UjhPLnWfj2GF2EpT0jmzaJKIWKHLsaSSajf35bcYnA==",
++      "dev": true,
++      "license": "ISC",
++      "dependencies": {
++        "xmlchars": "^2.2.0"
++      },
++      "engines": {
++        "node": ">=v12.22.7"
++      }
++    },
++    "node_modules/source-map-js": {
++      "version": "1.2.4",
++      "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.4.tgz",
++      "integrity": "sha512-J7ZjMvHd9O1fcT/5V09QWaaSl2BbWx3F6O08spde82Namf9UB0GxRVIPiNbVsdKkoizHiSpTodo3vp2bAy91MA==",
++      "dev": true,
++      "license": "BSD-3-Clause",
++      "engines": {
++        "node": ">=6.0.0"
++      }
++    },
++    "node_modules/tldts": {
++      "version": "7.5.6",
++      "resolved": "https://registry.npmjs.org/tldts/-/tldts-7.5.6.tgz",
++      "integrity": "sha512-78a/2zOOpMAgcd+GhQMx8tQSGYojszqzAKhXzd5/t7lgyglt1INshF2tiVfWBw9NNYaMuMVCz1RAcggt383LTg==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "tldts-core": "^7.5.6"
++      },
++      "bin": {
++        "tldts": "bin/cli.js"
++      }
++    },
++    "node_modules/tldts-core": {
++      "version": "7.5.6",
++      "resolved": "https://registry.npmjs.org/tldts-core/-/tldts-core-7.5.6.tgz",
++      "integrity": "sha512-ZKR8J39MaMREBzOCN6nKWxr0V3sAOhNxRth96uAwWLrliTYBKb+JhaUwkZl3naRSyd9HuJr6KPzS66oTCmYafw==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/tough-cookie": {
++      "version": "6.1.0",
++      "resolved": "https://registry.npmjs.org/tough-cookie/-/tough-cookie-6.1.0.tgz",
++      "integrity": "sha512-FTxc8u8Kl2tz0Lat1u8ksvcy8bwHRyEMawwTWybo51JqaC6O7SvfuhAKg+Ld6VqyIe2QRJBzY9HA7y2WyFRT2w==",
++      "dev": true,
++      "license": "BSD-3-Clause",
++      "dependencies": {
++        "tldts": "^7.0.5"
++      },
++      "engines": {
++        "node": ">=16"
++      }
++    },
++    "node_modules/tr46": {
++      "version": "7.0.0",
++      "resolved": "https://registry.npmjs.org/tr46/-/tr46-7.0.0.tgz",
++      "integrity": "sha512-BcDSDW+SIGWVOns1Zm6Yg91q9AEj7eaID0QDY9oIqJD1A8dscNwMcl9Sms2DeuWCNov1X0/oXanHGYQBSLwZsg==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "punycode": "^2.3.1"
++      },
++      "engines": {
++        "node": "^22.14.0 || >=24.0.0"
++      }
++    },
++    "node_modules/undici": {
++      "version": "8.13.1",
++      "resolved": "https://registry.npmjs.org/undici/-/undici-8.13.1.tgz",
++      "integrity": "sha512-Kt7EaPjh0s93lJH/PmW3d5rhkcpUa6fS3jqZ7+YGxNd9L7Xy/i827xe4C2uhhq+pJebM4tQOl5AgHmW11G5Skg==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=22.19.0"
++      }
++    },
++    "node_modules/vue": {
++      "version": "3.5.46",
++      "resolved": "https://registry.npmjs.org/vue/-/vue-3.5.46.tgz",
++      "integrity": "sha512-0kW5CgfjMPBqmH158049SaE1muufp+K/ZyrwvSEwrwYky6QB7zL2y8kXfruneKb9O12eh0xAJL6CVSpzb9o0Kg==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@vue/compiler-dom": "3.5.46",
++        "@vue/compiler-sfc": "3.5.46",
++        "@vue/runtime-dom": "3.5.46",
++        "@vue/server-renderer": "3.5.46",
++        "@vue/shared": "3.5.46"
++      },
++      "peerDependencies": {
++        "typescript": "*"
++      },
++      "peerDependenciesMeta": {
++        "typescript": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/w3c-xmlserializer": {
++      "version": "6.0.0",
++      "resolved": "https://registry.npmjs.org/w3c-xmlserializer/-/w3c-xmlserializer-6.0.0.tgz",
++      "integrity": "sha512-4Nsy8K5Tr6SPDH9jhKJOHf7ChDrc1zufZTVSF7x72hwuEXBqxqk9G6cK+K2NRUtB3iELRJqjXb4JPDMBjMTl2Q==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "xml-name-validator": "^5.0.0"
++      },
++      "engines": {
++        "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
++      }
++    },
++    "node_modules/webidl-conversions": {
++      "version": "8.0.1",
++      "resolved": "https://registry.npmjs.org/webidl-conversions/-/webidl-conversions-8.0.1.tgz",
++      "integrity": "sha512-BMhLD/Sw+GbJC21C/UgyaZX41nPt8bUTg+jWyDeg7e7YN4xOM05YPSIXceACnXVtqyEw/LMClUQMtMZ+PGGpqQ==",
++      "dev": true,
++      "license": "BSD-2-Clause",
++      "engines": {
++        "node": ">=20"
++      }
++    },
++    "node_modules/whatwg-mimetype": {
++      "version": "5.0.0",
++      "resolved": "https://registry.npmjs.org/whatwg-mimetype/-/whatwg-mimetype-5.0.0.tgz",
++      "integrity": "sha512-sXcNcHOC51uPGF0P/D4NVtrkjSU2fNsm9iog4ZvZJsL3rjoDAzXZhkm2MWt1y+PUdggKAYVoMAIYcs78wJ51Cw==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=20"
++      }
++    },
++    "node_modules/whatwg-url": {
++      "version": "17.3.0",
++      "resolved": "https://registry.npmjs.org/whatwg-url/-/whatwg-url-17.3.0.tgz",
++      "integrity": "sha512-KwOAJrpf+GTgBvcBQJcP38sMF0DsQKdwtG+TxM2pW44P6E5k0hDbWrDmyuJDIF0Uef0aQq0ZoJs+5oI+k8ddhg==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@exodus/bytes": "^1.16.0",
++        "tr46": "^7.0.0",
++        "webidl-conversions": "^8.0.1"
++      },
++      "engines": {
++        "node": "^22.14.0 || >=24.0.0"
++      }
++    },
++    "node_modules/xml-name-validator": {
++      "version": "5.0.0",
++      "resolved": "https://registry.npmjs.org/xml-name-validator/-/xml-name-validator-5.0.0.tgz",
++      "integrity": "sha512-EvGK8EJ3DhaHfbRlETOWAS5pO9MZITeauHKJyb8wyajUfQUenkIg2MvLDTZ4T/TgIcm3HU0TFBgWWboAZ30UHg==",
++      "dev": true,
++      "license": "Apache-2.0",
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/xmlchars": {
++      "version": "2.2.0",
++      "resolved": "https://registry.npmjs.org/xmlchars/-/xmlchars-2.2.0.tgz",
++      "integrity": "sha512-JZnDKK8B0RCDw84FNdDAIpZK+JuJw+s7Lz8nksI7SIuU3UXJJslUthsi+uWBUYOwPFwW7W7PRLRfUKpxjtjFCw==",
++      "dev": true,
++      "license": "MIT"
++    }
++  }
++}
+diff --git a/package.json b/package.json
+new file mode 100644
+index 0000000..4a0d405
+--- /dev/null
++++ b/package.json
+@@ -0,0 +1,15 @@
++{
++  "name": "laravel-payments-dev",
++  "private": true,
++  "type": "module",
++  "description": "Dev tooling only (builds the global JS bundle and runs the frontend tests). The package itself is installed with Composer.",
++  "scripts": {
++    "build": "node scripts/build-global.mjs",
++    "test": "node --test tests-js/core.test.mjs tests-js/dialog.test.mjs tests-js/blade.test.mjs"
++  },
++  "devDependencies": {
++    "@vue/compiler-sfc": "^3.5.46",
++    "jsdom": "^31.0.1",
++    "vue": "^3.5.46"
++  }
++}
+diff --git a/resources/dist/payments-blade.js b/resources/dist/payments-blade.js
+new file mode 100644
+index 0000000..ae60976
+--- /dev/null
++++ b/resources/dist/payments-blade.js
+@@ -0,0 +1,184 @@
++/* laravel-payments: vanilla-JS checkout dialog for Blade / Livewire / any server-rendered page.
++   Needs payments-core.global.js first. No framework, no build step. Edit freely: this file is yours once published. */
++(function (global) {
++  var STEPS = global.PaymentsCore.STEPS;
++
++  function h(tag, attrs) {
++    var node = document.createElement(tag);
++    Object.keys(attrs || {}).forEach(function (k) {
++      if (k === 'text') node.textContent = attrs[k];
++      else if (k.slice(0, 2) === 'on') node.addEventListener(k.slice(2), attrs[k]);
++      else if (attrs[k] !== null && attrs[k] !== undefined && attrs[k] !== false) node.setAttribute(k, attrs[k]);
++    });
++    for (var i = 2; i < arguments.length; i++) {
++      var kid = arguments[i];
++      if (kid) node.appendChild(typeof kid === 'string' ? document.createTextNode(kid) : kid);
++    }
++    return node;
++  }
++
++  function mount(id, cfg) {
++    var dialog = document.getElementById(id);
++    var opener = document.getElementById(id + '-open');
++    if (!dialog || !opener) return;
++
++    var body = dialog.querySelector('[data-payments-body]');
++    var title = dialog.querySelector('[data-payments-title]');
++    var csrf = document.querySelector('meta[name="csrf-token"]');
++    var flow = global.PaymentsCore.createPaymentFlow({
++      baseUrl: cfg.baseUrl,
++      credentials: 'same-origin',
++      headers: csrf ? { 'X-CSRF-TOKEN': csrf.getAttribute('content'), 'X-Requested-With': 'XMLHttpRequest' } : {},
++      pollInterval: cfg.pollInterval || 3000,
++    });
++
++    var selected = null;
++    var msisdn = '';
++    var otp = '';
++    var lastStep = null;
++
++    title.textContent = cfg.title || 'Pay';
++
++    function choices(s) {
++      return cfg.gateways && cfg.gateways.length
++        ? s.gateways.filter(function (g) { return cfg.gateways.indexOf(g.slug) !== -1; })
++        : s.gateways;
++    }
++    function needsPhone(s) {
++      var g = s.gateways.find(function (x) { return x.slug === selected; });
++      return !!g && g.driver !== 'paypal';
++    }
++    function fire(name, detail) {
++      dialog.dispatchEvent(new CustomEvent('payments:' + name, { bubbles: true, detail: detail }));
++    }
++    function close() {
++      flow.reset();
++      if (dialog.open) dialog.close();
++    }
++    function message(text, cls) {
++      return h('p', { 'class': 'payments-msg ' + (cls || ''), text: text });
++    }
++
++    function renderIdle(s) {
++      var list = choices(s);
++      if (list.length === 1 && !selected) selected = list[0].slug;
++      body.replaceChildren();
++
++      if (!list.length) return body.appendChild(message('No payment methods are available.'));
++
++      var ul = h('div', { 'class': 'payments-gateways', role: 'radiogroup' });
++      list.forEach(function (g) {
++        var radio = h('input', { type: 'radio', name: id + '-gw', value: g.slug, checked: selected === g.slug ? 'checked' : null,
++          onchange: function () { selected = g.slug; renderIdle(flow.getState()); } });
++        ul.appendChild(h('label', { 'class': 'payments-gateway' }, radio, h('span', { text: g.name })));
++      });
++      body.appendChild(ul);
++
++      var phone = null;
++      if (selected && needsPhone(s)) {
++        phone = h('input', { type: 'tel', 'class': 'payments-input', placeholder: 'Mobile number', value: msisdn,
++          oninput: function (e) { msisdn = e.target.value; update(); } });
++        body.appendChild(phone);
++      }
++
++      var pay = h('button', { type: 'button', 'class': 'payments-btn payments-btn-primary', onclick: function () {
++        flow.start({
++          gateway: selected,
++          productIds: cfg.productIds && cfg.productIds.length ? cfg.productIds : undefined,
++          msisdn: needsPhone(s) ? msisdn : undefined,
++          amount: cfg.amount == null ? undefined : cfg.amount,
++          description: cfg.description || undefined,
++          returnUrl: cfg.returnUrl || undefined,
++        });
++      } });
++      function update() {
++        var ok = !!selected && (!needsPhone(s) || !!msisdn.trim());
++        pay.disabled = !ok;
++        var g = s.gateways.find(function (x) { return x.slug === selected; });
++        pay.textContent = g ? 'Pay with ' + g.name : 'Choose a payment method';
++      }
++      update();
++      body.appendChild(pay);
++      if (phone) phone.focus();
++    }
++
++    function render(s) {
++      if (s.step === STEPS.IDLE) {
++        if (lastStep !== STEPS.IDLE || !body.firstChild) renderIdle(s);
++        lastStep = s.step;
++        return;
++      }
++      lastStep = s.step;
++      body.replaceChildren();
++
++      switch (s.step) {
++        case STEPS.CHARGING:
++          body.appendChild(message('Starting your payment...', 'payments-center'));
++          break;
++        case STEPS.POLLING:
++          body.appendChild(message(s.message || 'Approve the payment on your phone.', 'payments-center'));
++          body.appendChild(message('Keep this window open. We will confirm automatically.', 'payments-small'));
++          body.appendChild(h('button', { type: 'button', 'class': 'payments-btn', text: 'Cancel', onclick: function () { flow.reset(); } }));
++          break;
++        case STEPS.OTP:
++          var input = h('input', { type: 'text', inputmode: 'numeric', 'class': 'payments-input', placeholder: 'OTP',
++            oninput: function (e) { otp = e.target.value; go.disabled = s.busy || !otp.trim(); },
++            onkeyup: function (e) { if (e.key === 'Enter' && otp.trim()) flow.confirmOtp(otp.trim()); } });
++          var go = h('button', { type: 'button', 'class': 'payments-btn payments-btn-primary', text: s.busy ? 'Confirming...' : 'Confirm',
++            disabled: s.busy || !otp.trim() ? 'disabled' : null,
++            onclick: function () { flow.confirmOtp(otp.trim()); } });
++          input.value = otp;
++          body.appendChild(message(s.message || 'Enter the code we sent to your phone.'));
++          body.appendChild(input);
++          body.appendChild(go);
++          input.focus();
++          break;
++        case STEPS.REDIRECTING:
++          body.appendChild(message('Taking you to complete the payment...', 'payments-center'));
++          if (s.redirectUrl) body.appendChild(h('a', { 'class': 'payments-btn', href: s.redirectUrl, text: 'Continue' }));
++          break;
++        case STEPS.HTML:
++          body.appendChild(h('iframe', { 'class': 'payments-frame', srcdoc: s.html || '',
++            sandbox: 'allow-forms allow-scripts allow-same-origin allow-popups allow-top-navigation-by-user-activation' }));
++          break;
++        case STEPS.SUCCESS:
++          body.appendChild(message('Payment complete', 'payments-center payments-ok'));
++          body.appendChild(h('button', { type: 'button', 'class': 'payments-btn payments-btn-primary', text: 'Done', onclick: close }));
++          fire('success', s.result);
++          break;
++        case STEPS.FAILED:
++          body.appendChild(message(s.message || 'The payment did not go through.', 'payments-center payments-bad'));
++          body.appendChild(h('button', { type: 'button', 'class': 'payments-btn', text: 'Try again', onclick: function () { flow.reset(); } }));
++          body.appendChild(h('button', { type: 'button', 'class': 'payments-btn', text: 'Close', onclick: close }));
++          fire('failed', s.result);
++          break;
++        case STEPS.TIMEOUT:
++          body.appendChild(message(s.message || 'We have not received a confirmation yet.', 'payments-center'));
++          body.appendChild(message('If money left your account it will still be applied once confirmed.', 'payments-small'));
++          body.appendChild(h('button', { type: 'button', 'class': 'payments-btn payments-btn-primary', text: 'Keep waiting', onclick: function () { flow.keepWaiting(); } }));
++          body.appendChild(h('button', { type: 'button', 'class': 'payments-btn', text: 'Close', onclick: close }));
++          break;
++      }
++    }
++
++    flow.subscribe(render);
++
++    opener.addEventListener('click', function () {
++      selected = null; msisdn = ''; otp = '';
++      flow.reset();
++      dialog.showModal();
++      flow.loadGateways().then(function () { lastStep = null; render(flow.getState()); }).catch(function () { render(flow.getState()); });
++    });
++    dialog.querySelector('[data-payments-close]').addEventListener('click', close);
++    dialog.addEventListener('close', function () { flow.reset(); });
++
++    // Returning from PayPal / CPay card: ?reference=PAY...&status=... -> pick the payment back up.
++    var ref = new URLSearchParams(global.location.search).get(cfg.resumeParam || 'reference');
++    if (cfg.autoResume !== false && ref) {
++      dialog.showModal();
++      flow.resume(ref);
++    }
++  }
++
++  global.PaymentsBlade = { mount: mount };
++})(typeof window !== 'undefined' ? window : globalThis);
+diff --git a/resources/dist/payments-core.global.js b/resources/dist/payments-core.global.js
+new file mode 100644
+index 0000000..f184e74
+--- /dev/null
++++ b/resources/dist/payments-core.global.js
+@@ -0,0 +1,255 @@
++/* laravel-payments core (generated by scripts/build-global.mjs: do not edit) */
++(function (global) {
++/**
++ * Headless payment flow for laravel-payments. No framework, no DOM (except the default redirect).
++ * Every UI (Vue/Quasar, Blade, Livewire, React ...) is a thin view over this state machine.
++ *
++ * Steps: idle -> charging -> (otp | polling | redirecting | html) -> success | failed | timeout
++ */
++
++const STEPS = Object.freeze({
++  IDLE: 'idle',
++  CHARGING: 'charging',
++  OTP: 'otp',
++  POLLING: 'polling',
++  REDIRECTING: 'redirecting',
++  HTML: 'html',
++  SUCCESS: 'success',
++  FAILED: 'failed',
++  TIMEOUT: 'timeout',
++});
++
++const initialState = () => ({
++  step: STEPS.IDLE,
++  busy: false,
++  reference: null,
++  message: null,
++  redirectUrl: null,
++  html: null,
++  gateways: [],
++  result: null,
++});
++
++function createPaymentFlow(options = {}) {
++  const cfg = {
++    baseUrl: '/api/payments',
++    headers: {}, // object, or (async) function returning an object (e.g. bearer token)
++    credentials: 'same-origin',
++    pollInterval: 3000,
++    maxPolls: 60,
++    fetch: typeof fetch !== 'undefined' ? fetch.bind(globalThis) : undefined,
++    redirect: (url) => {
++      if (typeof window !== 'undefined') window.location.assign(url);
++    },
++    ...options,
++  };
++
++  let state = initialState();
++  const listeners = new Set();
++  let timer = null;
++  let run = 0; // bumps on every start/stop so stale polls can't touch a newer flow
++
++  const emit = () => listeners.forEach((fn) => fn({ ...state }));
++  const set = (patch) => {
++    state = { busy: false, ...state, ...patch, ...(patch.busy === undefined ? { busy: false } : {}) };
++    emit();
++  };
++
++  async function request(method, path, body) {
++    if (!cfg.fetch) throw new Error('No fetch implementation available.');
++
++    const extra = typeof cfg.headers === 'function' ? await cfg.headers() : cfg.headers;
++    const headers = { Accept: 'application/json', ...(body ? { 'Content-Type': 'application/json' } : {}), ...extra };
++
++    const res = await cfg.fetch(cfg.baseUrl.replace(/\/$/, '') + path, {
++      method,
++      headers,
++      credentials: cfg.credentials,
++      body: body ? JSON.stringify(body) : undefined,
++    });
++
++    let data = null;
++    try {
++      data = await res.json();
++    } catch {
++      data = null;
++    }
++
++    return { ok: res.ok, httpStatus: res.status, data };
++  }
++
++  function failFrom({ httpStatus, data }, fallback) {
++    const firstError = data?.errors ? Object.values(data.errors).flat()[0] : null;
++    return data?.message && !firstError ? data.message : firstError || fallback || `Request failed (${httpStatus}).`;
++  }
++
++  function applyResult(r) {
++    const base = { reference: r.reference ?? state.reference, message: r.message ?? null, result: r };
++
++    if (r.status === 'completed') return set({ ...base, step: STEPS.SUCCESS });
++    if (r.status === 'failed') return set({ ...base, step: STEPS.FAILED });
++
++    switch (r.action) {
++      case 'otp':
++        return set({ ...base, step: STEPS.OTP });
++      case 'redirect':
++        set({ ...base, step: STEPS.REDIRECTING, redirectUrl: r.redirect_url ?? null });
++        if (r.redirect_url) cfg.redirect?.(r.redirect_url);
++        return;
++      case 'html':
++        set({ ...base, step: STEPS.HTML, html: r.html ?? null, redirectUrl: r.redirect_url ?? null });
++        return startPolling();
++      default:
++        set({ ...base, step: STEPS.POLLING });
++        return startPolling();
++    }
++  }
++
++  function stopPolling() {
++    run++;
++    if (timer) clearTimeout(timer);
++    timer = null;
++  }
++
++  function startPolling({ immediate = false } = {}) {
++    stopPolling();
++    const id = run;
++    let polls = 0;
++
++    const tick = async () => {
++      if (id !== run || !state.reference) return;
++      polls++;
++
++      try {
++        const { data } = await request('GET', `/status/${encodeURIComponent(state.reference)}`);
++        if (id !== run) return;
++
++        if (data && (data.status === 'completed' || data.status === 'failed')) {
++          applyResult(data);
++          return;
++        }
++        if (data?.message && data.message !== state.message) set({ message: data.message });
++      } catch {
++        // transient network error: keep polling until maxPolls
++      }
++
++      if (id !== run) return;
++      if (polls >= cfg.maxPolls) {
++        set({ step: STEPS.TIMEOUT, message: 'We have not received a confirmation yet.' });
++        return;
++      }
++      timer = setTimeout(tick, cfg.pollInterval);
++    };
++
++    timer = setTimeout(tick, immediate ? 0 : cfg.pollInterval);
++  }
++
++  const api = {
++    getState: () => ({ ...state }),
++
++    subscribe(fn) {
++      listeners.add(fn);
++      fn({ ...state });
++      return () => listeners.delete(fn);
++    },
++
++    async loadGateways() {
++      const res = await request('GET', '/gateways');
++      const list = res.data?.data ?? [];
++      set({ gateways: list });
++      return list;
++    },
++
++    /**
++     * @param {{gateway:string, productId?:string|number, productIds?:Array, msisdn?:string, amount?:number,
++     *          description?:string, currency?:string, returnUrl?:string, email?:string, method?:string, meta?:object}} input
++     */
++    async start(input) {
++      if (!input?.gateway) {
++        set({ step: STEPS.FAILED, message: 'Choose a payment method.' });
++        return;
++      }
++
++      stopPolling();
++      set({ step: STEPS.CHARGING, busy: true, message: null, reference: null, redirectUrl: null, html: null, result: null });
++
++      const body = {
++        gateway: input.gateway,
++        product_ids: input.productIds,
++        product_id: input.productIds ? undefined : input.productId,
++        msisdn: input.msisdn,
++        amount: input.amount,
++        description: input.description,
++        currency: input.currency,
++        return_url: input.returnUrl,
++        email: input.email,
++        method: input.method,
++        meta: input.meta,
++      };
++      Object.keys(body).forEach((k) => body[k] === undefined && delete body[k]);
++
++      try {
++        const res = await request('POST', '/charge', body);
++        if (res.data?.status) return applyResult(res.data);
++        set({ step: STEPS.FAILED, message: failFrom(res) });
++      } catch (e) {
++        set({ step: STEPS.FAILED, message: e.message || 'Network error. Please try again.' });
++      }
++    },
++
++    /** CPay: the customer typed the OTP from their SMS. */
++    async confirmOtp(otp) {
++      if (!state.reference) return;
++      set({ busy: true });
++      try {
++        const res = await request('POST', '/confirm', { reference: state.reference, otp });
++        if (res.data?.status) return applyResult(res.data);
++        set({ message: failFrom(res) });
++      } catch (e) {
++        set({ message: e.message || 'Network error. Please try again.' });
++      }
++    },
++
++    /** PayPal JS SDK flow: send the approved order id back for capture. */
++    async confirmPaypal(orderId) {
++      if (!state.reference) return;
++      set({ busy: true });
++      try {
++        const res = await request('POST', '/confirm', { reference: state.reference, order_id: orderId });
++        if (res.data?.status) return applyResult(res.data);
++        set({ message: failFrom(res) });
++      } catch (e) {
++        set({ message: e.message || 'Network error. Please try again.' });
++      }
++    },
++
++    /** After a redirect return (?reference=...), pick the flow back up. */
++    resume(reference) {
++      set({ reference, step: STEPS.POLLING, message: null });
++      startPolling({ immediate: true });
++    },
++
++    /** Try again after a timeout without charging twice. */
++    keepWaiting() {
++      if (!state.reference) return;
++      set({ step: STEPS.POLLING, message: null });
++      startPolling({ immediate: true });
++    },
++
++    reset() {
++      stopPolling();
++      state = { ...initialState(), gateways: state.gateways };
++      emit();
++    },
++
++    destroy() {
++      stopPolling();
++      listeners.clear();
++    },
++  };
++
++  return api;
++}
++
++  global.PaymentsCore = { STEPS: STEPS, createPaymentFlow: createPaymentFlow };
++})(typeof window !== 'undefined' ? window : globalThis);
+diff --git a/resources/js/core/payments-core.js b/resources/js/core/payments-core.js
+new file mode 100644
+index 0000000..54f8e74
+--- /dev/null
++++ b/resources/js/core/payments-core.js
+@@ -0,0 +1,250 @@
++/**
++ * Headless payment flow for laravel-payments. No framework, no DOM (except the default redirect).
++ * Every UI (Vue/Quasar, Blade, Livewire, React ...) is a thin view over this state machine.
++ *
++ * Steps: idle -> charging -> (otp | polling | redirecting | html) -> success | failed | timeout
++ */
++
++export const STEPS = Object.freeze({
++  IDLE: 'idle',
++  CHARGING: 'charging',
++  OTP: 'otp',
++  POLLING: 'polling',
++  REDIRECTING: 'redirecting',
++  HTML: 'html',
++  SUCCESS: 'success',
++  FAILED: 'failed',
++  TIMEOUT: 'timeout',
++});
++
++const initialState = () => ({
++  step: STEPS.IDLE,
++  busy: false,
++  reference: null,
++  message: null,
++  redirectUrl: null,
++  html: null,
++  gateways: [],
++  result: null,
++});
++
++export function createPaymentFlow(options = {}) {
++  const cfg = {
++    baseUrl: '/api/payments',
++    headers: {}, // object, or (async) function returning an object (e.g. bearer token)
++    credentials: 'same-origin',
++    pollInterval: 3000,
++    maxPolls: 60,
++    fetch: typeof fetch !== 'undefined' ? fetch.bind(globalThis) : undefined,
++    redirect: (url) => {
++      if (typeof window !== 'undefined') window.location.assign(url);
++    },
++    ...options,
++  };
++
++  let state = initialState();
++  const listeners = new Set();
++  let timer = null;
++  let run = 0; // bumps on every start/stop so stale polls can't touch a newer flow
++
++  const emit = () => listeners.forEach((fn) => fn({ ...state }));
++  const set = (patch) => {
++    state = { busy: false, ...state, ...patch, ...(patch.busy === undefined ? { busy: false } : {}) };
++    emit();
++  };
++
++  async function request(method, path, body) {
++    if (!cfg.fetch) throw new Error('No fetch implementation available.');
++
++    const extra = typeof cfg.headers === 'function' ? await cfg.headers() : cfg.headers;
++    const headers = { Accept: 'application/json', ...(body ? { 'Content-Type': 'application/json' } : {}), ...extra };
++
++    const res = await cfg.fetch(cfg.baseUrl.replace(/\/$/, '') + path, {
++      method,
++      headers,
++      credentials: cfg.credentials,
++      body: body ? JSON.stringify(body) : undefined,
++    });
++
++    let data = null;
++    try {
++      data = await res.json();
++    } catch {
++      data = null;
++    }
++
++    return { ok: res.ok, httpStatus: res.status, data };
++  }
++
++  function failFrom({ httpStatus, data }, fallback) {
++    const firstError = data?.errors ? Object.values(data.errors).flat()[0] : null;
++    return data?.message && !firstError ? data.message : firstError || fallback || `Request failed (${httpStatus}).`;
++  }
++
++  function applyResult(r) {
++    const base = { reference: r.reference ?? state.reference, message: r.message ?? null, result: r };
++
++    if (r.status === 'completed') return set({ ...base, step: STEPS.SUCCESS });
++    if (r.status === 'failed') return set({ ...base, step: STEPS.FAILED });
++
++    switch (r.action) {
++      case 'otp':
++        return set({ ...base, step: STEPS.OTP });
++      case 'redirect':
++        set({ ...base, step: STEPS.REDIRECTING, redirectUrl: r.redirect_url ?? null });
++        if (r.redirect_url) cfg.redirect?.(r.redirect_url);
++        return;
++      case 'html':
++        set({ ...base, step: STEPS.HTML, html: r.html ?? null, redirectUrl: r.redirect_url ?? null });
++        return startPolling();
++      default:
++        set({ ...base, step: STEPS.POLLING });
++        return startPolling();
++    }
++  }
++
++  function stopPolling() {
++    run++;
++    if (timer) clearTimeout(timer);
++    timer = null;
++  }
++
++  function startPolling({ immediate = false } = {}) {
++    stopPolling();
++    const id = run;
++    let polls = 0;
++
++    const tick = async () => {
++      if (id !== run || !state.reference) return;
++      polls++;
++
++      try {
++        const { data } = await request('GET', `/status/${encodeURIComponent(state.reference)}`);
++        if (id !== run) return;
++
++        if (data && (data.status === 'completed' || data.status === 'failed')) {
++          applyResult(data);
++          return;
++        }
++        if (data?.message && data.message !== state.message) set({ message: data.message });
++      } catch {
++        // transient network error: keep polling until maxPolls
++      }
++
++      if (id !== run) return;
++      if (polls >= cfg.maxPolls) {
++        set({ step: STEPS.TIMEOUT, message: 'We have not received a confirmation yet.' });
++        return;
++      }
++      timer = setTimeout(tick, cfg.pollInterval);
++    };
++
++    timer = setTimeout(tick, immediate ? 0 : cfg.pollInterval);
++  }
++
++  const api = {
++    getState: () => ({ ...state }),
++
++    subscribe(fn) {
++      listeners.add(fn);
++      fn({ ...state });
++      return () => listeners.delete(fn);
++    },
++
++    async loadGateways() {
++      const res = await request('GET', '/gateways');
++      const list = res.data?.data ?? [];
++      set({ gateways: list });
++      return list;
++    },
++
++    /**
++     * @param {{gateway:string, productId?:string|number, productIds?:Array, msisdn?:string, amount?:number,
++     *          description?:string, currency?:string, returnUrl?:string, email?:string, method?:string, meta?:object}} input
++     */
++    async start(input) {
++      if (!input?.gateway) {
++        set({ step: STEPS.FAILED, message: 'Choose a payment method.' });
++        return;
++      }
++
++      stopPolling();
++      set({ step: STEPS.CHARGING, busy: true, message: null, reference: null, redirectUrl: null, html: null, result: null });
++
++      const body = {
++        gateway: input.gateway,
++        product_ids: input.productIds,
++        product_id: input.productIds ? undefined : input.productId,
++        msisdn: input.msisdn,
++        amount: input.amount,
++        description: input.description,
++        currency: input.currency,
++        return_url: input.returnUrl,
++        email: input.email,
++        method: input.method,
++        meta: input.meta,
++      };
++      Object.keys(body).forEach((k) => body[k] === undefined && delete body[k]);
++
++      try {
++        const res = await request('POST', '/charge', body);
++        if (res.data?.status) return applyResult(res.data);
++        set({ step: STEPS.FAILED, message: failFrom(res) });
++      } catch (e) {
++        set({ step: STEPS.FAILED, message: e.message || 'Network error. Please try again.' });
++      }
++    },
++
++    /** CPay: the customer typed the OTP from their SMS. */
++    async confirmOtp(otp) {
++      if (!state.reference) return;
++      set({ busy: true });
++      try {
++        const res = await request('POST', '/confirm', { reference: state.reference, otp });
++        if (res.data?.status) return applyResult(res.data);
++        set({ message: failFrom(res) });
++      } catch (e) {
++        set({ message: e.message || 'Network error. Please try again.' });
++      }
++    },
++
++    /** PayPal JS SDK flow: send the approved order id back for capture. */
++    async confirmPaypal(orderId) {
++      if (!state.reference) return;
++      set({ busy: true });
++      try {
++        const res = await request('POST', '/confirm', { reference: state.reference, order_id: orderId });
++        if (res.data?.status) return applyResult(res.data);
++        set({ message: failFrom(res) });
++      } catch (e) {
++        set({ message: e.message || 'Network error. Please try again.' });
++      }
++    },
++
++    /** After a redirect return (?reference=...), pick the flow back up. */
++    resume(reference) {
++      set({ reference, step: STEPS.POLLING, message: null });
++      startPolling({ immediate: true });
++    },
++
++    /** Try again after a timeout without charging twice. */
++    keepWaiting() {
++      if (!state.reference) return;
++      set({ step: STEPS.POLLING, message: null });
++      startPolling({ immediate: true });
++    },
++
++    reset() {
++      stopPolling();
++      state = { ...initialState(), gateways: state.gateways };
++      emit();
++    },
++
++    destroy() {
++      stopPolling();
++      listeners.clear();
++    },
++  };
++
++  return api;
++}
+diff --git a/resources/js/vue/PaymentDialog.vue b/resources/js/vue/PaymentDialog.vue
+new file mode 100644
+index 0000000..3f5dc08
+--- /dev/null
++++ b/resources/js/vue/PaymentDialog.vue
+@@ -0,0 +1,222 @@
++<!--
++  Quasar payment dialog. Drop it anywhere:
++
++    <PaymentDialog v-model="open" :product-ids="[song.id]" :headers="authHeaders" @success="onPaid" />
++
++  Quasar components are auto-imported by the Quasar CLI. Copy and restyle freely: this file is yours.
++-->
++<template>
++  <q-dialog :model-value="modelValue" persistent @update:model-value="onToggle">
++    <q-card style="width: 420px; max-width: 94vw">
++      <q-card-section class="row items-center q-pb-none">
++        <div class="text-h6">{{ title }}</div>
++        <q-space />
++        <q-btn icon="close" flat round dense :disable="state.step === STEPS.CHARGING" @click="close" />
++      </q-card-section>
++
++      <!-- choose gateway + phone -->
++      <q-card-section v-if="state.step === STEPS.IDLE">
++        <div v-if="!choices.length" class="text-grey-7">No payment methods are available.</div>
++
++        <q-list v-else bordered separator class="rounded-borders">
++          <q-item
++            v-for="g in choices"
++            :key="g.slug"
++            v-ripple
++            clickable
++            :active="selected === g.slug"
++            active-class="bg-blue-1"
++            @click="selected = g.slug"
++          >
++            <q-item-section avatar><q-radio v-model="selected" :val="g.slug" /></q-item-section>
++            <q-item-section>{{ g.name }}</q-item-section>
++          </q-item>
++        </q-list>
++
++        <q-input
++          v-if="selected && needsPhone"
++          v-model="msisdn"
++          class="q-mt-md"
++          type="tel"
++          label="Mobile number"
++          outlined
++          dense
++          autofocus
++          :rules="[(v) => !!v || 'Enter your mobile number']"
++        />
++
++        <q-btn
++          class="full-width q-mt-md"
++          color="primary"
++          unelevated
++          :label="payLabel"
++          :disable="!canPay"
++          @click="pay"
++        />
++      </q-card-section>
++
++      <!-- charging -->
++      <q-card-section v-else-if="state.step === STEPS.CHARGING" class="text-center q-py-lg">
++        <q-spinner size="40px" color="primary" />
++        <div class="q-mt-md text-grey-7">Starting your payment...</div>
++      </q-card-section>
++
++      <!-- waiting for the phone -->
++      <q-card-section v-else-if="state.step === STEPS.POLLING" class="text-center q-py-lg">
++        <q-spinner-dots size="48px" color="primary" />
++        <div class="q-mt-md">{{ state.message || 'Approve the payment on your phone.' }}</div>
++        <div class="text-caption text-grey-7 q-mt-xs">Keep this window open. We will confirm automatically.</div>
++        <q-btn class="q-mt-md" flat no-caps label="Cancel" @click="cancel" />
++      </q-card-section>
++
++      <!-- OTP -->
++      <q-card-section v-else-if="state.step === STEPS.OTP">
++        <div>{{ state.message || 'Enter the code we sent to your phone.' }}</div>
++        <q-input v-model="otp" class="q-mt-md" label="OTP" inputmode="numeric" outlined dense autofocus @keyup.enter="submitOtp" />
++        <q-btn class="full-width q-mt-md" color="primary" unelevated label="Confirm" :loading="state.busy" :disable="!otp" @click="submitOtp" />
++      </q-card-section>
++
++      <!-- redirecting (PayPal) -->
++      <q-card-section v-else-if="state.step === STEPS.REDIRECTING" class="text-center q-py-lg">
++        <q-spinner size="40px" color="primary" />
++        <div class="q-mt-md">Taking you to complete the payment...</div>
++        <q-btn v-if="state.redirectUrl" class="q-mt-md" flat no-caps label="Continue" :href="state.redirectUrl" />
++      </q-card-section>
++
++      <!-- card iframe -->
++      <q-card-section v-else-if="state.step === STEPS.HTML">
++        <iframe
++          :srcdoc="state.html"
++          sandbox="allow-forms allow-scripts allow-same-origin allow-popups allow-top-navigation-by-user-activation"
++          style="width: 100%; height: 420px; border: 0"
++        />
++      </q-card-section>
++
++      <!-- success -->
++      <q-card-section v-else-if="state.step === STEPS.SUCCESS" class="text-center q-py-lg">
++        <q-icon name="check_circle" color="positive" size="64px" />
++        <div class="text-h6 q-mt-sm">Payment complete</div>
++        <q-btn class="q-mt-md" color="primary" unelevated label="Done" @click="close" />
++      </q-card-section>
++
++      <!-- failed -->
++      <q-card-section v-else-if="state.step === STEPS.FAILED" class="text-center q-py-lg">
++        <q-icon name="error" color="negative" size="64px" />
++        <div class="text-subtitle1 q-mt-sm">{{ state.message || 'The payment did not go through.' }}</div>
++        <div class="q-mt-md">
++          <q-btn flat no-caps label="Try again" @click="reset" />
++          <q-btn flat no-caps label="Close" @click="close" />
++        </div>
++      </q-card-section>
++
++      <!-- timeout -->
++      <q-card-section v-else-if="state.step === STEPS.TIMEOUT" class="text-center q-py-lg">
++        <q-icon name="schedule" color="warning" size="64px" />
++        <div class="q-mt-sm">{{ state.message }}</div>
++        <div class="text-caption text-grey-7">If money left your account it will still be applied once confirmed.</div>
++        <div class="q-mt-md">
++          <q-btn color="primary" unelevated no-caps label="Keep waiting" @click="keepWaiting" />
++          <q-btn flat no-caps label="Close" @click="close" />
++        </div>
++      </q-card-section>
++    </q-card>
++  </q-dialog>
++</template>
++
++<script setup>
++import { computed, ref, watch } from 'vue';
++import { usePayment } from './usePayment.js';
++
++const props = defineProps({
++  modelValue: { type: Boolean, default: false },
++  title: { type: String, default: 'Pay' },
++  productIds: { type: Array, default: () => [] },
++  amount: { type: Number, default: undefined }, // only when the server has no ProductResolver
++  description: { type: String, default: undefined },
++  currency: { type: String, default: undefined },
++  gateways: { type: Array, default: () => [] }, // limit to these slugs; empty = all
++  defaultMsisdn: { type: String, default: '' },
++  returnUrl: { type: String, default: undefined },
++  email: { type: String, default: undefined },
++  baseUrl: { type: String, default: '/api/payments' },
++  headers: { type: [Object, Function], default: () => ({}) },
++  credentials: { type: String, default: 'same-origin' },
++  pollInterval: { type: Number, default: 3000 },
++  resumeReference: { type: String, default: undefined }, // pass ?reference=... after a redirect return
++});
++
++const emit = defineEmits(['update:modelValue', 'success', 'failed']);
++
++const { state, STEPS, loadGateways, start, confirmOtp, keepWaiting, resume, reset, flow } = usePayment({
++  baseUrl: props.baseUrl,
++  headers: props.headers,
++  credentials: props.credentials,
++  pollInterval: props.pollInterval,
++});
++
++const selected = ref(null);
++const msisdn = ref(props.defaultMsisdn);
++const otp = ref('');
++
++const choices = computed(() =>
++  props.gateways.length ? state.gateways.filter((g) => props.gateways.includes(g.slug)) : state.gateways
++);
++const current = computed(() => state.gateways.find((g) => g.slug === selected.value));
++const needsPhone = computed(() => current.value && current.value.driver !== 'paypal');
++const canPay = computed(() => !!selected.value && (!needsPhone.value || !!msisdn.value));
++const payLabel = computed(() => (current.value ? `Pay with ${current.value.name}` : 'Choose a payment method'));
++
++watch(
++  () => props.modelValue,
++  async (open) => {
++    if (!open) return;
++    otp.value = '';
++    try {
++      await loadGateways();
++    } catch {
++      /* the idle step shows "no payment methods" */
++    }
++    if (choices.value.length === 1) selected.value = choices.value[0].slug;
++    if (props.resumeReference) resume(props.resumeReference);
++  },
++  { immediate: true }
++);
++
++watch(
++  () => state.step,
++  (step) => {
++    if (step === STEPS.SUCCESS) emit('success', state.result);
++    if (step === STEPS.FAILED) emit('failed', state.result);
++  }
++);
++
++function pay() {
++  return start({
++    gateway: selected.value,
++    productIds: props.productIds.length ? props.productIds : undefined,
++    msisdn: needsPhone.value ? msisdn.value : undefined,
++    amount: props.amount,
++    description: props.description,
++    currency: props.currency,
++    returnUrl: props.returnUrl,
++    email: props.email,
++  });
++}
++
++function submitOtp() {
++  if (otp.value) confirmOtp(otp.value);
++}
++
++function cancel() {
++  reset();
++}
++
++function close() {
++  flow.reset(); // stops polling; the server keeps processing the payment either way
++  emit('update:modelValue', false);
++}
++
++function onToggle(value) {
++  if (!value) close();
++}
++</script>
+diff --git a/resources/js/vue/usePayment.js b/resources/js/vue/usePayment.js
+new file mode 100644
+index 0000000..78513cd
+--- /dev/null
++++ b/resources/js/vue/usePayment.js
+@@ -0,0 +1,38 @@
++import { computed, getCurrentInstance, onBeforeUnmount, reactive } from 'vue';
++import { createPaymentFlow, STEPS } from '../core/payments-core.js';
++
++/**
++ * Vue 3 composable over the headless payment flow.
++ *
++ *   const { state, start, confirmOtp } = usePayment({ baseUrl: '/api/payments', headers: () => ({ Authorization: `Bearer ${token}` }) });
++ *   await start({ gateway: 'mpesa', productIds: [12], msisdn: '58123456' });
++ *   state.step   // 'polling' ... 'success'
++ */
++export function usePayment(options = {}) {
++  const flow = createPaymentFlow(options);
++  const state = reactive(flow.getState());
++  const off = flow.subscribe((s) => Object.assign(state, s));
++
++  if (getCurrentInstance()) {
++    onBeforeUnmount(() => {
++      off();
++      flow.destroy();
++    });
++  }
++
++  const finished = computed(() => [STEPS.SUCCESS, STEPS.FAILED, STEPS.TIMEOUT].includes(state.step));
++
++  return {
++    state,
++    STEPS,
++    finished,
++    flow,
++    loadGateways: flow.loadGateways,
++    start: flow.start,
++    confirmOtp: flow.confirmOtp,
++    confirmPaypal: flow.confirmPaypal,
++    resume: flow.resume,
++    keepWaiting: flow.keepWaiting,
++    reset: flow.reset,
++  };
++}
+diff --git a/resources/views/components/payments/checkout.blade.php b/resources/views/components/payments/checkout.blade.php
+new file mode 100644
+index 0000000..6744d74
+--- /dev/null
++++ b/resources/views/components/payments/checkout.blade.php
+@@ -0,0 +1,67 @@
++{{--
++    Blade checkout button + dialog. Yours to restyle once published.
++
++    <x-payments.checkout :product-ids="[$song->id]" label="Buy now" :gateways="['mpesa','ecocash']" />
++
++    Needs (the installer adds both):  public/vendor/payments/payments-core.global.js  and  payments-blade.js
++    Auth: the package routes use `auth:sanctum` by default. For a classic session-auth Blade app set in config/payments.php:
++          'routes' => ['middleware' => ['web'], 'auth_middleware' => ['auth']]   (this component sends the CSRF header for you)
++--}}
++@props([
++    'productIds' => [],
++    'label' => 'Buy now',
++    'title' => 'Pay',
++    'gateways' => [],
++    'returnUrl' => null,
++    'amount' => null,
++    'description' => null,
++    'baseUrl' => null,
++])
++
++@php
++    $uid = 'payments-'.\Illuminate\Support\Str::random(8);
++    $options = [
++        'baseUrl' => $baseUrl ?: url(config('payments.routes.prefix', 'api/payments')),
++        'productIds' => array_values((array) $productIds),
++        'gateways' => array_values((array) $gateways),
++        'title' => $title,
++        'returnUrl' => $returnUrl,
++        'amount' => $amount,
++        'description' => $description,
++    ];
++@endphp
++
++<button type="button" id="{{ $uid }}-open" {{ $attributes->merge(['class' => 'payments-open']) }}>{{ $label }}</button>
++
++<dialog id="{{ $uid }}" class="payments-dialog">
++    <div class="payments-head">
++        <strong data-payments-title></strong>
++        <button type="button" class="payments-x" data-payments-close aria-label="Close">&times;</button>
++    </div>
++    <div data-payments-body></div>
++</dialog>
++
++@once
++    <style>
++        .payments-dialog { border: 0; border-radius: 12px; padding: 20px; width: 400px; max-width: 94vw; box-shadow: 0 10px 40px rgba(0,0,0,.25); }
++        .payments-dialog::backdrop { background: rgba(0,0,0,.45); }
++        .payments-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
++        .payments-x { border: 0; background: none; font-size: 22px; cursor: pointer; }
++        .payments-gateway { display: flex; gap: 10px; align-items: center; padding: 10px; border: 1px solid #ddd; border-radius: 8px; margin-bottom: 8px; cursor: pointer; }
++        .payments-input { width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid #ccc; border-radius: 8px; margin: 8px 0; }
++        .payments-btn { display: inline-block; padding: 10px 16px; border: 1px solid #ccc; background: #fff; border-radius: 8px; cursor: pointer; margin: 6px 6px 0 0; text-decoration: none; color: inherit; }
++        .payments-btn-primary { width: 100%; margin-right: 0; background: #1976d2; border-color: #1976d2; color: #fff; }
++        .payments-btn:disabled { opacity: .5; cursor: not-allowed; }
++        .payments-center { text-align: center; }
++        .payments-small { font-size: 12px; color: #777; text-align: center; }
++        .payments-ok { color: #2e7d32; font-size: 20px; }
++        .payments-bad { color: #c62828; }
++        .payments-frame { width: 100%; height: 420px; border: 0; }
++    </style>
++    <script src="{{ asset('vendor/payments/payments-core.global.js') }}"></script>
++    <script src="{{ asset('vendor/payments/payments-blade.js') }}"></script>
++@endonce
++
++<script>
++    window.PaymentsBlade.mount(@json($uid), @json($options));
++</script>
+diff --git a/scripts/build-global.mjs b/scripts/build-global.mjs
+new file mode 100644
+index 0000000..5015dfc
+--- /dev/null
++++ b/scripts/build-global.mjs
+@@ -0,0 +1,15 @@
++// Builds resources/dist/payments-core.global.js (plain <script>, exposes window.PaymentsCore)
++// from the ES module, so Blade/Livewire apps need no bundler:  node scripts/build-global.mjs
++import { readFileSync, writeFileSync } from 'node:fs';
++
++const src = readFileSync(new URL('../resources/js/core/payments-core.js', import.meta.url), 'utf8');
++const body = src.replace(/^export /gm, '');
++const out = `/* laravel-payments core (generated by scripts/build-global.mjs: do not edit) */
++(function (global) {
++${body}
++  global.PaymentsCore = { STEPS: STEPS, createPaymentFlow: createPaymentFlow };
++})(typeof window !== 'undefined' ? window : globalThis);
++`;
++
++writeFileSync(new URL('../resources/dist/payments-core.global.js', import.meta.url), out);
++console.log('built resources/dist/payments-core.global.js');
+diff --git a/src/Console/InstallCommand.php b/src/Console/InstallCommand.php
+new file mode 100644
+index 0000000..992ab08
+--- /dev/null
++++ b/src/Console/InstallCommand.php
+@@ -0,0 +1,245 @@
++<?php
++
++namespace Molefigog\Payments\Console;
++
++use Illuminate\Console\Command;
++use Molefigog\Payments\Support\StubPublisher;
++
++class InstallCommand extends Command
++{
++    protected $signature = 'payments:install
++        {--all : Publish everything}
++        {--config : Publish config/payments.php}
++        {--migrations : Copy the migrations into database/migrations}
++        {--models : Create App\Models\Payment and PaymentGateway extending the package models}
++        {--listener : Create a PaymentCompleted listener stub}
++        {--resolver : Create a ProductResolver stub (server-side pricing)}
++        {--vue : Copy the Vue 3 / Quasar composable and PaymentDialog}
++        {--vue-path= : Where the Vue files go (default resources/js/payments; use ../my-quasar-app/src/payments for a separate app)}
++        {--blade : Copy the Blade checkout component and its JS}
++        {--force : Overwrite files that already exist}';
++
++    protected $description = 'Choose what to publish: config, migrations, model/listener/resolver stubs and frontend (Vue/Quasar, Blade).';
++
++    /** @var array<string,string> */
++    private const CHOICES = [
++        'config' => 'Config (config/payments.php)',
++        'migrations' => 'Migrations (copy into database/migrations)',
++        'models' => 'Model stubs (App\Models\Payment, PaymentGateway: extend the package models)',
++        'listener' => 'Listener stub (runs when a payment completes)',
++        'resolver' => 'Product resolver stub (server-side pricing)',
++        'vue' => 'Vue 3 / Quasar: usePayment() + PaymentDialog',
++        'blade' => 'Blade: <x-payments.checkout> (also works inside Livewire pages)',
++    ];
++
++    private StubPublisher $publisher;
++
++    public function handle(): int
++    {
++        $this->publisher = new StubPublisher((bool) $this->option('force'));
++        $selected = $this->selection();
++
++        if ($selected === []) {
++            $this->components->warn('Nothing selected.');
++
++            return self::SUCCESS;
++        }
++
++        foreach (array_keys(self::CHOICES) as $key) {
++            if (in_array($key, $selected, true)) {
++                $this->components->info('Publishing: '.$key);
++                $this->{'publish'.ucfirst($key)}();
++            }
++        }
++
++        $this->newLine();
++        $this->components->info('Done. Next: php artisan migrate');
++
++        return self::SUCCESS;
++    }
++
++    /** @return array<int,string> */
++    private function selection(): array
++    {
++        if ($this->option('all')) {
++            return array_keys(self::CHOICES);
++        }
++
++        $flagged = array_values(array_filter(array_keys(self::CHOICES), fn ($key) => (bool) $this->option($key)));
++        if ($flagged !== []) {
++            return $flagged;
++        }
++
++        if (! $this->input->isInteractive()) {
++            return ['config', 'migrations'];
++        }
++
++        if (function_exists('Laravel\Prompts\multiselect')) {
++            return array_values(\Laravel\Prompts\multiselect(
++                label: 'What should be published?',
++                options: self::CHOICES,
++                default: ['config', 'migrations'],
++                scroll: 8,
++                hint: 'Space to tick, Enter to confirm. Re-run any time; existing files are never overwritten without --force.',
++            ));
++        }
++
++        $picked = $this->choice('What should be published? (comma separated)', array_values(self::CHOICES), null, null, true);
++
++        return array_values(array_keys(array_intersect(self::CHOICES, (array) $picked)));
++    }
++
++    private function publishConfig(): void
++    {
++        $this->callSilently('vendor:publish', ['--tag' => 'payments-config', '--force' => (bool) $this->option('force')]);
++        $this->report(config_path('payments.php'), is_file(config_path('payments.php')) ? 'ready' : 'missing');
++    }
++
++    private function publishMigrations(): void
++    {
++        $this->callSilently('vendor:publish', ['--tag' => 'payments-migrations', '--force' => (bool) $this->option('force')]);
++        $this->report(database_path('migrations'), 'copied (existing files kept)');
++    }
++
++    private function publishModels(): void
++    {
++        $ns = $this->laravel->getNamespace();   // "App\"
++        $stubs = $this->stubs();
++
++        $targets = ['Payment' => 'payment', 'PaymentGateway' => 'gateway'];
++
++        foreach ($targets as $class => $configKey) {
++            $path = app_path("Models/$class.php");
++            $this->report($path, $this->publisher->file("$stubs/$class.stub", $path, ['rootNamespace' => $ns]));
++
++            $contents = is_file($path) ? (string) file_get_contents($path) : '';
++            if (! str_contains($contents, 'Molefigog\\Payments\\Models')) {
++                $this->components->warn("{$ns}Models\\$class already exists and does not extend the package model. "
++                    ."Make it extend Molefigog\\Payments\\Models\\$class, then set payments.models.$configKey.");
++
++                continue;
++            }
++
++            $this->patchConfig(
++                "'$configKey' => Molefigog\\Payments\\Models\\$class::class,",
++                "'$configKey' => {$ns}Models\\$class::class,",
++                "models.$configKey => {$ns}Models\\$class"
++            );
++        }
++    }
++
++    private function publishListener(): void
++    {
++        $ns = $this->laravel->getNamespace();
++        $path = app_path('Listeners/HandlePaymentCompleted.php');
++        $this->report($path, $this->publisher->file($this->stubs().'/HandlePaymentCompleted.stub', $path, ['rootNamespace' => $ns]));
++    }
++
++    private function publishResolver(): void
++    {
++        $ns = $this->laravel->getNamespace();
++        $path = app_path('Payments/AppProductResolver.php');
++        $this->report($path, $this->publisher->file($this->stubs().'/AppProductResolver.stub', $path, ['rootNamespace' => $ns]));
++
++        $this->patchConfig(
++            "'resolver' => null,",
++            "'resolver' => {$ns}Payments\\AppProductResolver::class,",
++            "resolver => {$ns}Payments\\AppProductResolver"
++        );
++        $this->components->warn('Implement AppProductResolver::resolve(): until then every charge fails safely.');
++    }
++
++    private function publishVue(): void
++    {
++        $default = 'resources/js/payments';
++        $path = (string) ($this->option('vue-path') ?: '');
++
++        if ($path === '' && $this->input->isInteractive() && ! $this->option('all') && function_exists('Laravel\Prompts\text')) {
++            $path = \Laravel\Prompts\text(
++                label: 'Where should the Vue files go?',
++                default: $default,
++                hint: 'Quasar app in a separate project? e.g. ../Musik-Frontend2/src/payments'
++            );
++        }
++
++        $dest = StubPublisher::resolvePath($path !== '' ? $path : $default, base_path());
++        $js = $this->packageRoot().'/resources/js';
++
++        foreach (array_merge(
++            $this->publisher->directory("$js/core", "$dest/core"),
++            $this->publisher->directory("$js/vue", "$dest/vue"),
++        ) as $file => $status) {
++            $this->report($file, $status);
++        }
++
++        $this->line("  Use it:  import PaymentDialog from '<alias>/payments/vue/PaymentDialog.vue'");
++        $this->line("  or:      import { usePayment } from '<alias>/payments/vue/usePayment.js'   (needs vue; the dialog uses Quasar)");
++    }
++
++    private function publishBlade(): void
++    {
++        $root = $this->packageRoot();
++
++        $this->report(
++            $view = resource_path('views/components/payments/checkout.blade.php'),
++            $this->publisher->file("$root/resources/views/components/payments/checkout.blade.php", $view)
++        );
++
++        foreach (['payments-core.global.js', 'payments-blade.js'] as $asset) {
++            $this->report(
++                $target = public_path("vendor/payments/$asset"),
++                $this->publisher->file("$root/resources/dist/$asset", $target)
++            );
++        }
++
++        $this->line('  Use it:  <x-payments.checkout :product-ids="[$item->id]" label="Buy now" />');
++    }
++
++    private function patchConfig(string $search, string $replace, string $label): void
++    {
++        $file = config_path('payments.php');
++
++        if (! is_file($file)) {
++            $this->components->warn("Publish the config too, then set: $label");
++
++            return;
++        }
++
++        $contents = (string) file_get_contents($file);
++
++        if (str_contains($contents, $replace)) {
++            return;
++        }
++
++        if (! str_contains($contents, $search)) {
++            $this->components->warn("Could not update config/payments.php automatically. Set: $label");
++
++            return;
++        }
++
++        file_put_contents($file, str_replace($search, $replace, $contents));
++        $this->report($file, 'updated: '.$label);
++    }
++
++    private function report(string $path, string $status): void
++    {
++        $this->components->twoColumnDetail($this->relative($path), $status);
++    }
++
++    private function relative(string $path): string
++    {
++        $base = rtrim(base_path(), '/\\');
++
++        return str_starts_with($path, $base) ? ltrim(substr($path, strlen($base)), '/\\') : $path;
++    }
++
++    private function stubs(): string
++    {
++        return $this->packageRoot().'/stubs';
++    }
++
++    private function packageRoot(): string
++    {
++        return dirname(__DIR__, 2);
++    }
++}
+diff --git a/src/Console/ReconcileCommand.php b/src/Console/ReconcileCommand.php
+index f831008..d3def92 100644
+--- a/src/Console/ReconcileCommand.php
++++ b/src/Console/ReconcileCommand.php
+@@ -5,6 +5,7 @@ namespace Molefigog\Payments\Console;
+ use Illuminate\Console\Command;
+ use Molefigog\Payments\Models\Payment;
+ use Molefigog\Payments\PaymentService;
++use Molefigog\Payments\Support\Models;
+ 
+ class ReconcileCommand extends Command
+ {
+@@ -14,7 +15,7 @@ class ReconcileCommand extends Command
+ 
+     public function handle(PaymentService $payments): int
+     {
+-        $references = Payment::query()
++        $references = Models::payment()::query()
+             ->where('status', 'pending')
+             ->where('created_at', '>=', now()->subMinutes((int) $this->option('minutes')))
+             ->whereNotNull('reference')
+diff --git a/src/Console/SeedGatewaysCommand.php b/src/Console/SeedGatewaysCommand.php
+index 0cc60a9..859bc12 100644
+--- a/src/Console/SeedGatewaysCommand.php
++++ b/src/Console/SeedGatewaysCommand.php
+@@ -4,6 +4,7 @@ namespace Molefigog\Payments\Console;
+ 
+ use Illuminate\Console\Command;
+ use Molefigog\Payments\Models\PaymentGateway;
++use Molefigog\Payments\Support\Models;
+ 
+ class SeedGatewaysCommand extends Command
+ {
+@@ -16,7 +17,7 @@ class SeedGatewaysCommand extends Command
+         $created = 0;
+ 
+         foreach ((array) config('payments.gateways', []) as $slug => $cfg) {
+-            $row = PaymentGateway::query()->firstOrCreate(['slug' => $slug], [
++            $row = Models::gateway()::query()->firstOrCreate(['slug' => $slug], [
+                 'name' => $cfg['name'] ?? $slug,
+                 'driver' => $cfg['driver'] ?? $slug,
+                 'enabled' => (bool) ($cfg['enabled'] ?? true),
+diff --git a/src/GatewayManager.php b/src/GatewayManager.php
+index 44ab12e..4c35cdd 100644
+--- a/src/GatewayManager.php
++++ b/src/GatewayManager.php
+@@ -9,6 +9,7 @@ use Molefigog\Payments\Contracts\PaymentGateway;
+ use Molefigog\Payments\Exceptions\PaymentException;
+ use Molefigog\Payments\Models\PaymentGateway as GatewayModel;
+ use Throwable;
++use Molefigog\Payments\Support\Models;
+ 
+ class GatewayManager
+ {
+@@ -62,7 +63,7 @@ class GatewayManager
+         $slugs = collect(array_keys((array) config('payments.gateways', [])));
+ 
+         try {
+-            $slugs = $slugs->merge(GatewayModel::query()->pluck('slug'));
++            $slugs = $slugs->merge(Models::gateway()::query()->pluck('slug'));
+         } catch (Throwable) {
+             // table not migrated yet: config only
+         }
+@@ -111,7 +112,7 @@ class GatewayManager
+     protected function row(string $slug): ?GatewayModel
+     {
+         try {
+-            return GatewayModel::query()->where('slug', $slug)->first();
++            return Models::gateway()::query()->where('slug', $slug)->first();
+         } catch (Throwable) {
+             return null;
+         }
+diff --git a/src/PaymentService.php b/src/PaymentService.php
+index ef94ce8..7de652d 100644
+--- a/src/PaymentService.php
++++ b/src/PaymentService.php
+@@ -20,6 +20,7 @@ use Molefigog\Payments\Support\ChargeResult;
+ use Molefigog\Payments\Support\GatewayResponse;
+ use Molefigog\Payments\Support\RedirectGuard;
+ use Throwable;
++use Molefigog\Payments\Support\Models;
+ 
+ class PaymentService
+ {
+@@ -50,7 +51,7 @@ class PaymentService
+         }
+ 
+         $rows = DB::transaction(function () use ($lines, $request, $reference, $currency, $options) {
+-            return collect($lines)->map(fn (array $line) => Payment::create([
++            return collect($lines)->map(fn (array $line) => Models::payment()::create([
+                 'reference' => $reference,
+                 'user_id' => $request->userId,
+                 'product_id' => $line['product_id'],
+@@ -184,7 +185,7 @@ class PaymentService
+      */
+     public function rows(string $idOrReference): Collection
+     {
+-        $first = Payment::query()
++        $first = Models::payment()::query()
+             ->where('reference', $idOrReference)
+             ->orWhere('txn_id', $idOrReference)
+             ->orWhere('conversation_id', $idOrReference)
+@@ -195,7 +196,7 @@ class PaymentService
+             return collect();
+         }
+ 
+-        return Payment::query()->where('reference', $first->reference)->orderBy('id')->get();
++        return Models::payment()::query()->where('reference', $first->reference)->orderBy('id')->get();
+     }
+ 
+     /*
+@@ -291,7 +292,7 @@ class PaymentService
+     protected function apply(string $reference, GatewayResponse $response): array
+     {
+         return DB::transaction(function () use ($reference, $response) {
+-            $rows = Payment::query()->where('reference', $reference)->orderBy('id')->lockForUpdate()->get();
++            $rows = Models::payment()::query()->where('reference', $reference)->orderBy('id')->lockForUpdate()->get();
+ 
+             if ($rows->isEmpty()) {
+                 return [$rows, null];
+@@ -323,9 +324,9 @@ class PaymentService
+                 $update['paid_at'] = now();
+             }
+ 
+-            Payment::query()->where('reference', $reference)->update($update);
++            Models::payment()::query()->where('reference', $reference)->update($update);
+ 
+-            $fresh = Payment::query()->where('reference', $reference)->orderBy('id')->get();
++            $fresh = Models::payment()::query()->where('reference', $reference)->orderBy('id')->get();
+ 
+             $transition = null;
+             if ($new === 'completed') {
+diff --git a/src/PaymentsServiceProvider.php b/src/PaymentsServiceProvider.php
+index a8b75c6..19a63a4 100644
+--- a/src/PaymentsServiceProvider.php
++++ b/src/PaymentsServiceProvider.php
+@@ -3,6 +3,7 @@
+ namespace Molefigog\Payments;
+ 
+ use Illuminate\Support\ServiceProvider;
++use Molefigog\Payments\Console\InstallCommand;
+ use Molefigog\Payments\Console\ReconcileCommand;
+ use Molefigog\Payments\Console\SeedGatewaysCommand;
+ 
+@@ -28,7 +29,18 @@ class PaymentsServiceProvider extends ServiceProvider
+             $this->publishes([__DIR__.'/../config/payments.php' => config_path('payments.php')], 'payments-config');
+             $this->publishes([__DIR__.'/../database/migrations' => database_path('migrations')], 'payments-migrations');
+ 
+-            $this->commands([SeedGatewaysCommand::class, ReconcileCommand::class]);
++            // Plain `vendor:publish` tags (the interactive way is: php artisan payments:install)
++            $this->publishes([__DIR__.'/../resources/js/core' => resource_path('js/payments/core')], 'payments-js-core');
++            $this->publishes([
++                __DIR__.'/../resources/js/core' => resource_path('js/payments/core'),
++                __DIR__.'/../resources/js/vue' => resource_path('js/payments/vue'),
++            ], 'payments-vue');
++            $this->publishes([
++                __DIR__.'/../resources/views/components/payments' => resource_path('views/components/payments'),
++                __DIR__.'/../resources/dist' => public_path('vendor/payments'),
++            ], 'payments-blade');
++
++            $this->commands([InstallCommand::class, SeedGatewaysCommand::class, ReconcileCommand::class]);
+         }
+     }
+ }
+diff --git a/src/Support/Models.php b/src/Support/Models.php
+new file mode 100644
+index 0000000..2fef82c
+--- /dev/null
++++ b/src/Support/Models.php
+@@ -0,0 +1,25 @@
++<?php
++
++namespace Molefigog\Payments\Support;
++
++use Molefigog\Payments\Models\Payment;
++use Molefigog\Payments\Models\PaymentGateway;
++
++/**
++ * Resolves the Eloquent classes the package uses, so an app can extend them
++ * (App\Models\Payment extends the package model) and point `payments.models` at its own.
++ */
++final class Models
++{
++    /** @return class-string<Payment> */
++    public static function payment(): string
++    {
++        return config('payments.models.payment') ?: Payment::class;
++    }
++
++    /** @return class-string<PaymentGateway> */
++    public static function gateway(): string
++    {
++        return config('payments.models.gateway') ?: PaymentGateway::class;
++    }
++}
+diff --git a/src/Support/StubPublisher.php b/src/Support/StubPublisher.php
+new file mode 100644
+index 0000000..9a4e078
+--- /dev/null
++++ b/src/Support/StubPublisher.php
+@@ -0,0 +1,73 @@
++<?php
++
++namespace Molefigog\Payments\Support;
++
++/** Copies stub/asset files into an app without clobbering the user's edits (unless forced). Plain PHP, no framework. */
++final class StubPublisher
++{
++    public const CREATED = 'created';
++    public const EXISTS = 'exists';
++    public const OVERWRITTEN = 'overwritten';
++
++    public function __construct(private readonly bool $force = false)
++    {
++    }
++
++    /** @param array<string,string> $replace  {{ key }} placeholders to fill */
++    public function file(string $from, string $to, array $replace = []): string
++    {
++        if (! is_file($from)) {
++            throw new \InvalidArgumentException("Missing stub: $from");
++        }
++
++        $existed = is_file($to);
++        if ($existed && ! $this->force) {
++            return self::EXISTS;
++        }
++
++        $contents = (string) file_get_contents($from);
++        foreach ($replace as $key => $value) {
++            $contents = str_replace('{{ '.$key.' }}', $value, $contents);
++        }
++
++        $dir = dirname($to);
++        if (! is_dir($dir) && ! mkdir($dir, 0775, true) && ! is_dir($dir)) {
++            throw new \RuntimeException("Could not create directory: $dir");
++        }
++
++        file_put_contents($to, $contents);
++
++        return $existed ? self::OVERWRITTEN : self::CREATED;
++    }
++
++    /** @return array<string,string>  destination path => status */
++    public function directory(string $from, string $to, array $replace = []): array
++    {
++        $results = [];
++        $from = rtrim($from, '/\\');
++        $to = rtrim($to, '/\\');
++
++        $iterator = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($from, \FilesystemIterator::SKIP_DOTS));
++
++        foreach ($iterator as $item) {
++            if (! $item->isFile()) {
++                continue;
++            }
++            $relative = ltrim(substr($item->getPathname(), strlen($from)), '/\\');
++            $destination = $to.DIRECTORY_SEPARATOR.$relative;
++            $results[$destination] = $this->file($item->getPathname(), $destination, $replace);
++        }
++
++        ksort($results);
++
++        return $results;
++    }
++
++    /** Absolute paths pass through; relative ones are resolved against $base. */
++    public static function resolvePath(string $path, string $base): string
++    {
++        $isAbsolute = str_starts_with($path, '/') || str_starts_with($path, '\\') || (bool) preg_match('/^[A-Za-z]:[\\\\\/]/', $path);
++
++        return $isAbsolute ? $path : rtrim($base, '/\\').DIRECTORY_SEPARATOR.$path;
++    }
++}
+diff --git a/src/Traits/HasPayments.php b/src/Traits/HasPayments.php
+index 6fd1794..1577667 100644
+--- a/src/Traits/HasPayments.php
++++ b/src/Traits/HasPayments.php
+@@ -7,13 +7,14 @@ use Molefigog\Payments\Models\Payment;
+ use Molefigog\Payments\PaymentService;
+ use Molefigog\Payments\Support\ChargeRequest;
+ use Molefigog\Payments\Support\ChargeResult;
++use Molefigog\Payments\Support\Models;
+ 
+ /** Add to your User model: `use HasPayments;` then `$user->charge(...)`. */
+ trait HasPayments
+ {
+     public function payments(): HasMany
+     {
+-        return $this->hasMany(Payment::class, 'user_id');
++        return $this->hasMany(Models::payment(), 'user_id');
+     }
+ 
+     /**
+diff --git a/stubs/AppProductResolver.stub b/stubs/AppProductResolver.stub
+new file mode 100644
+index 0000000..ac4bb54
+--- /dev/null
++++ b/stubs/AppProductResolver.stub
+@@ -0,0 +1,28 @@
++<?php
++
++namespace {{ rootNamespace }}Payments;
++
++use Molefigog\Payments\Contracts\ProductResolver;
++use Molefigog\Payments\Support\Product;
++
++/**
++ * Looks products up on the SERVER, so a client can never choose its own price.
++ * Registered in config/payments.php ('resolver'). Returning no products makes every charge fail safely
++ * until you implement this.
++ */
++class AppProductResolver implements ProductResolver
++{
++    public function resolve(array $productIds, array $context = []): array
++    {
++        // Example:
++        //
++        // return \App\Models\Song::findMany($productIds)->map(fn ($song) => new Product(
++        //     id: $song->id,
++        //     title: $song->title,
++        //     amount: (float) $song->price,
++        //     payeeId: $song->user_id,      // optional: who gets paid (stored as payee_id)
++        // ))->all();
++
++        return [];
++    }
++}
+diff --git a/stubs/HandlePaymentCompleted.stub b/stubs/HandlePaymentCompleted.stub
+new file mode 100644
+index 0000000..4c41242
+--- /dev/null
++++ b/stubs/HandlePaymentCompleted.stub
+@@ -0,0 +1,24 @@
++<?php
++
++namespace {{ rootNamespace }}Listeners;
++
++use Molefigog\Payments\Events\PaymentCompleted;
++
++/**
++ * Runs once per successful charge, even if the provider retries its webhook.
++ * Laravel 11+ discovers this listener automatically; on older versions register it in EventServiceProvider.
++ * Add `implements ShouldQueue` to run it on the queue.
++ */
++class HandlePaymentCompleted
++{
++    public function handle(PaymentCompleted $event): void
++    {
++        foreach ($event->payments as $payment) {
++            // One row per product:
++            //   $payment->product_id, $payment->amount, $payment->payee_id (seller),
++            //   $payment->user_id, $payment->gateway, $payment->reference
++            //
++            // e.g. credit the seller, unlock the download, create the task, send the invoice ...
++        }
++    }
++}
+diff --git a/stubs/Payment.stub b/stubs/Payment.stub
+new file mode 100644
+index 0000000..c309767
+--- /dev/null
++++ b/stubs/Payment.stub
+@@ -0,0 +1,18 @@
++<?php
++
++namespace {{ rootNamespace }}Models;
++
++use Molefigog\Payments\Models\Payment as BasePayment;
++
++/**
++ * Your Payment model. It extends the package model, so package updates still reach you,
++ * and you can add relations, scopes and casts here. Registered in config/payments.php ('models').
++ */
++class Payment extends BasePayment
++{
++    // Example: link a payment to your own product model (product_id is a plain string column).
++    // public function product()
++    // {
++    //     return $this->belongsTo(Product::class, 'product_id');
++    // }
++}
+diff --git a/stubs/PaymentGateway.stub b/stubs/PaymentGateway.stub
+new file mode 100644
+index 0000000..1aa65d1
+--- /dev/null
++++ b/stubs/PaymentGateway.stub
+@@ -0,0 +1,10 @@
++<?php
++
++namespace {{ rootNamespace }}Models;
++
++use Molefigog\Payments\Models\PaymentGateway as BasePaymentGateway;
++
++/** Your gateway model (e.g. to manage gateways from your admin panel). Registered in config/payments.php ('models'). */
++class PaymentGateway extends BasePaymentGateway
++{
++}
+diff --git a/tests-js/blade.test.mjs b/tests-js/blade.test.mjs
+new file mode 100644
+index 0000000..2fa4ddc
+--- /dev/null
++++ b/tests-js/blade.test.mjs
+@@ -0,0 +1,126 @@
++import { JSDOM } from 'jsdom';
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++
++import { fileURLToPath } from 'node:url';
++const root = fileURLToPath(new URL('../resources/dist/', import.meta.url));
++const wait = (ms) => new Promise((r) => setTimeout(r, ms));
++
++function boot({ search = '' } = {}) {
++  const dom = new JSDOM(`<!doctype html><html><head><meta name="csrf-token" content="TOK"></head><body>
++    <button type="button" id="p1-open" class="payments-open">Buy now</button>
++    <dialog id="p1"><strong data-payments-title></strong><button data-payments-close>x</button><div data-payments-body></div></dialog>
++  </body></html>`, { url: 'http://app.test/' + search, runScripts: 'outside-only', pretendToBeVisual: true });
++  const w = dom.window;
++  // jsdom has no <dialog>.showModal
++  w.HTMLElement.prototype.showModal = function () { this.setAttribute('open', ''); };
++  w.HTMLElement.prototype.close = function () { this.removeAttribute('open'); this.dispatchEvent(new w.Event('close')); };
++  Object.defineProperty(w.HTMLElement.prototype, 'open', { get() { return this.hasAttribute('open'); } });
++
++  const calls = [];
++  let polls = 0;
++  w.fetch = async (url, init) => {
++    const path = new URL(url, 'http://app.test').pathname.replace('/api/payments', '');
++    const body = init.body ? JSON.parse(init.body) : null;
++    calls.push({ method: init.method, path, headers: init.headers, body });
++    const reply = (b, status = 200) => ({ ok: status < 400, status, json: async () => b });
++    if (path === '/gateways') return reply({ data: [
++      { slug: 'mpesa', name: 'M-Pesa', driver: 'mpesa', currency: 'LSL', public: {} },
++      { slug: 'cpay', name: 'CPay', driver: 'cpay', currency: 'LSL', public: {} } ] });
++    if (path === '/charge') return body.gateway === 'cpay'
++      ? reply({ status: 'pending', action: 'otp', reference: 'R2', message: 'Enter the code we sent.' })
++      : reply({ status: 'pending', action: 'poll', reference: 'R1', message: 'Approve on your phone.' });
++    if (path.startsWith('/status/')) return reply({ status: ++polls >= 2 ? 'completed' : 'pending', reference: path.split('/').pop() });
++    if (path === '/confirm') return reply({ status: 'completed', reference: 'R2' });
++    throw new Error('unmocked ' + path);
++  };
++
++  w.eval(readFileSync(root + 'payments-core.global.js', 'utf8'));
++  w.eval(readFileSync(root + 'payments-blade.js', 'utf8'));
++  return { w, doc: w.document, calls };
++}
++const until = async (fn, label) => { const end = Date.now() + 1500; while (!fn()) { if (Date.now() > end) assert.fail('timeout: ' + label); await wait(3); } };
++const body = (d) => d.querySelector('[data-payments-body]').textContent.replace(/\s+/g, ' ').trim();
++const btn = (d, t) => [...d.querySelectorAll('button, a')].find((b) => b.textContent.includes(t));
++const type = (w, el, v) => { el.value = v; el.dispatchEvent(new w.Event('input', { bubbles: true })); };
++
++// 1. full M-Pesa flow
++{
++  const { w, doc, calls } = boot();
++  const events = [];
++  doc.getElementById('p1').addEventListener('payments:success', () => events.push('success'));
++  w.PaymentsBlade.mount('p1', { baseUrl: '/api/payments', productIds: [12], gateways: [], title: 'Pay for song', pollInterval: 5 });
++  assert.equal(doc.querySelector('[data-payments-title]').textContent, 'Pay for song');
++
++  doc.getElementById('p1-open').click();
++  await until(() => body(doc).includes('M-Pesa'), 'gateways');
++  assert.ok(doc.getElementById('p1').hasAttribute('open'));
++  assert.equal(btn(doc, 'Choose a payment method').disabled, true);
++
++  doc.querySelector('input[type=radio]').dispatchEvent(new w.Event('change'));
++  assert.ok(btn(doc, 'Pay with M-Pesa').disabled, 'needs a phone first');
++  type(w, doc.querySelector('input[type=tel]'), '58123456');
++  assert.equal(btn(doc, 'Pay with M-Pesa').disabled, false);
++  btn(doc, 'Pay with M-Pesa').click();
++
++  await until(() => body(doc).includes('Approve on your phone'), 'polling');
++  await until(() => body(doc).includes('Payment complete'), 'success');
++  assert.deepEqual(events, ['success']);
++  const charge = calls.find((c) => c.path === '/charge');
++  assert.deepEqual(charge.body, { gateway: 'mpesa', product_ids: [12], msisdn: '58123456' });
++  assert.equal(charge.headers['X-CSRF-TOKEN'], 'TOK', 'CSRF header sent');
++
++  btn(doc, 'Done').click();
++  assert.equal(doc.getElementById('p1').hasAttribute('open'), false, 'Done closes');
++  console.log('ok  Blade M-Pesa flow incl. CSRF header + payments:success event');
++}
++
++// 2. OTP keeps typed code through busy re-render
++{
++  const { w, doc, calls } = boot();
++  w.PaymentsBlade.mount('p1', { baseUrl: '/api/payments', productIds: [3], gateways: ['cpay'], pollInterval: 5 });
++  doc.getElementById('p1-open').click();
++  await until(() => body(doc).includes('Pay with CPay'), 'single gateway preselected + filtered');
++  assert.ok(!body(doc).includes('M-Pesa'));
++  type(w, doc.querySelector('input[type=tel]'), '58000000');
++  btn(doc, 'Pay with CPay').click();
++  await until(() => body(doc).includes('Enter the code we sent'), 'otp');
++  assert.equal(btn(doc, 'Confirm').disabled, true, 'disabled with empty otp');
++  type(w, doc.querySelector('input[inputmode=numeric]'), '654321');
++  assert.equal(btn(doc, 'Confirm').disabled, false);
++  btn(doc, 'Confirm').click();
++  await until(() => body(doc).includes('Payment complete'), 'success');
++  assert.deepEqual(calls.find((c) => c.path === '/confirm').body, { reference: 'R2', otp: '654321' });
++  console.log('ok  Blade CPay OTP flow + gateway filter');
++}
++
++// 3. return from redirect resumes by ?reference=
++{
++  const { w, doc, calls } = boot({ search: '?reference=PAY99&status=pending' });
++  w.PaymentsBlade.mount('p1', { baseUrl: '/api/payments', productIds: [], gateways: [], pollInterval: 5 });
++  await until(() => body(doc).includes('Payment complete'), 'resumed to success');
++  assert.ok(calls.some((c) => c.path === '/status/PAY99'));
++  console.log('ok  Blade resumes after redirect (?reference=)');
++}
++
++// 4. hostile server text is rendered as text, never as HTML
++{
++  const { w, doc } = boot();
++  const evil = '<img src=x onerror="window.pwned=1">';
++  w.fetch = async (url) => {
++    const path = new URL(url, 'http://app.test').pathname.replace('/api/payments', '');
++    if (path === '/gateways') return { ok: true, status: 200, json: async () => ({ data: [{ slug: 'mpesa', name: 'M-Pesa', driver: 'mpesa', currency: 'LSL', public: {} }] }) };
++    return { ok: false, status: 422, json: async () => ({ success: false, status: 'failed', message: evil }) };
++  };
++  w.PaymentsBlade.mount('p1', { baseUrl: '/api/payments', productIds: [1], gateways: [], pollInterval: 5 });
++  doc.getElementById('p1-open').click();
++  await until(() => body(doc).includes('Pay with M-Pesa'), 'idle');
++  type(w, doc.querySelector('input[type=tel]'), '5');
++  btn(doc, 'Pay with M-Pesa').click();
++  await until(() => body(doc).includes('<img'), 'failed message shown');
++  assert.equal(doc.querySelectorAll('img').length, 0, 'no <img> element was created');
++  assert.equal(w.pwned, undefined);
++  console.log('ok  hostile server message rendered as inert text');
++}
++console.log('\nBlade checks passed');
++process.exit(0);
+diff --git a/tests-js/core.test.mjs b/tests-js/core.test.mjs
+new file mode 100644
+index 0000000..eef4455
+--- /dev/null
++++ b/tests-js/core.test.mjs
+@@ -0,0 +1,202 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { createPaymentFlow, STEPS } from '../resources/js/core/payments-core.js';
++
++// A tiny fake API: routes -> queue of responses.
++function mockApi(routes) {
++  const calls = [];
++  const fetch = async (url, init) => {
++    const path = new URL(url, 'http://x').pathname;
++    calls.push({ method: init.method, path, headers: init.headers, body: init.body ? JSON.parse(init.body) : null });
++    const key = `${init.method} ${path.replace('/api/payments', '')}`.replace(/\/status\/.+/, '/status/:ref');
++    const queue = routes[key];
++    if (!queue) throw new Error(`unmocked ${key}`);
++    const next = typeof queue === 'function' ? queue() : queue.length > 1 ? queue.shift() : queue[0];
++    if (next instanceof Error) throw next;
++    return { ok: (next.http ?? 200) < 400, status: next.http ?? 200, json: async () => next.body };
++  };
++  return { fetch, calls };
++}
++const wait = (ms) => new Promise((r) => setTimeout(r, ms));
++const until = async (flow, step, ms = 1000) => {
++  const end = Date.now() + ms;
++  while (flow.getState().step !== step) {
++    if (Date.now() > end) assert.fail(`never reached "${step}", stuck at "${flow.getState().step}"`);
++    await wait(2);
++  }
++};
++const base = { pollInterval: 5, maxPolls: 5 };
++
++test('M-Pesa: charge -> poll (pending, pending, completed) -> success', async () => {
++  const api = mockApi({
++    'POST /charge': [{ body: { status: 'pending', action: 'poll', reference: 'PAY1', message: 'Approve on phone' } }],
++    'GET /status/:ref': [
++      { body: { status: 'pending', action: 'none', reference: 'PAY1' } },
++      { body: { status: 'pending', action: 'none', reference: 'PAY1' } },
++      { body: { status: 'completed', action: 'none', reference: 'PAY1' } },
++    ],
++  });
++  const flow = createPaymentFlow({ ...base, fetch: api.fetch, headers: async () => ({ Authorization: 'Bearer t' }) });
++  await flow.start({ gateway: 'mpesa', productIds: [12, 15], msisdn: '58123456' });
++  assert.equal(flow.getState().step, STEPS.POLLING);
++  assert.equal(flow.getState().reference, 'PAY1');
++  await until(flow, STEPS.SUCCESS);
++
++  const charge = api.calls[0];
++  assert.deepEqual(charge.body, { gateway: 'mpesa', product_ids: [12, 15], msisdn: '58123456' });
++  assert.equal(charge.headers.Authorization, 'Bearer t');
++  assert.equal(charge.headers['Content-Type'], 'application/json');
++  assert.ok(api.calls.filter((c) => c.path.includes('/status/PAY1')).length >= 3);
++  flow.destroy();
++});
++
++test('CPay: charge -> otp -> confirm -> success', async () => {
++  const api = mockApi({
++    'POST /charge': [{ body: { status: 'pending', action: 'otp', reference: 'PAY2' } }],
++    'POST /confirm': [{ body: { status: 'completed', action: 'none', reference: 'PAY2' } }],
++  });
++  const flow = createPaymentFlow({ ...base, fetch: api.fetch });
++  await flow.start({ gateway: 'cpay', productId: 7, msisdn: '58123456' });
++  assert.equal(flow.getState().step, STEPS.OTP);
++  await flow.confirmOtp('123456');
++  assert.equal(flow.getState().step, STEPS.SUCCESS);
++  assert.deepEqual(api.calls[1].body, { reference: 'PAY2', otp: '123456' });
++  assert.equal(api.calls[0].body.product_id, 7);
++  assert.equal('product_ids' in api.calls[0].body, false);
++});
++
++test('PayPal: redirect action calls redirect() once and does not poll', async () => {
++  const api = mockApi({
++    'POST /charge': [{ body: { status: 'pending', action: 'redirect', reference: 'PAY3', redirect_url: 'https://paypal.test/approve' } }],
++  });
++  const redirected = [];
++  const flow = createPaymentFlow({ ...base, fetch: api.fetch, redirect: (u) => redirected.push(u) });
++  await flow.start({ gateway: 'paypal', productId: 1, returnUrl: 'https://app.test/done' });
++  assert.equal(flow.getState().step, STEPS.REDIRECTING);
++  assert.deepEqual(redirected, ['https://paypal.test/approve']);
++  assert.equal(api.calls[0].body.return_url, 'https://app.test/done');
++  await wait(30);
++  assert.equal(api.calls.length, 1, 'no polling after redirect');
++});
++
++test('card iframe: html action exposes html and polls', async () => {
++  const api = mockApi({
++    'POST /charge': [{ body: { status: 'pending', action: 'html', reference: 'PAY4', html: '<iframe></iframe>' } }],
++    'GET /status/:ref': [{ body: { status: 'completed', reference: 'PAY4' } }],
++  });
++  const flow = createPaymentFlow({ ...base, fetch: api.fetch });
++  await flow.start({ gateway: 'cpay', productId: 1, method: 'card' });
++  assert.equal(flow.getState().html, '<iframe></iframe>');
++  await until(flow, STEPS.SUCCESS);
++});
++
++test('server says failed (422 body) -> failed with message', async () => {
++  const api = mockApi({ 'POST /charge': [{ http: 422, body: { success: false, status: 'failed', message: 'M-Pesa could not start the payment.' } }] });
++  const flow = createPaymentFlow({ ...base, fetch: api.fetch });
++  await flow.start({ gateway: 'mpesa', productId: 1, msisdn: '5' });
++  assert.equal(flow.getState().step, STEPS.FAILED);
++  assert.equal(flow.getState().message, 'M-Pesa could not start the payment.');
++});
++
++test('validation error (Laravel 422 shape) surfaces the first field error', async () => {
++  const api = mockApi({ 'POST /charge': [{ http: 422, body: { message: 'The gateway field is required.', errors: { gateway: ['The gateway field is required.'] } } }] });
++  const flow = createPaymentFlow({ ...base, fetch: api.fetch });
++  await flow.start({ gateway: 'x' });
++  assert.equal(flow.getState().step, STEPS.FAILED);
++  assert.equal(flow.getState().message, 'The gateway field is required.');
++});
++
++test('401 without a payment body -> failed with a readable message', async () => {
++  const api = mockApi({ 'POST /charge': [{ http: 401, body: { message: 'Unauthenticated.' } }] });
++  const flow = createPaymentFlow({ ...base, fetch: api.fetch });
++  await flow.start({ gateway: 'mpesa', productId: 1 });
++  assert.equal(flow.getState().message, 'Unauthenticated.');
++});
++
++test('network error on start -> failed, flow is reusable', async () => {
++  const api = mockApi({ 'POST /charge': [new Error('offline')] });
++  const flow = createPaymentFlow({ ...base, fetch: api.fetch });
++  await flow.start({ gateway: 'mpesa', productId: 1 });
++  assert.equal(flow.getState().step, STEPS.FAILED);
++  assert.equal(flow.getState().message, 'offline');
++  flow.reset();
++  assert.equal(flow.getState().step, STEPS.IDLE);
++});
++
++test('missing gateway fails fast without calling the API', async () => {
++  const api = mockApi({});
++  const flow = createPaymentFlow({ fetch: api.fetch });
++  await flow.start({ productId: 1 });
++  assert.equal(flow.getState().step, STEPS.FAILED);
++  assert.equal(api.calls.length, 0);
++});
++
++test('polling gives up after maxPolls -> timeout, keepWaiting resumes', async () => {
++  let n = 0;
++  const api = mockApi({
++    'POST /charge': [{ body: { status: 'pending', action: 'poll', reference: 'PAY5' } }],
++    'GET /status/:ref': () => (++n > 6 ? { body: { status: 'completed', reference: 'PAY5' } } : { body: { status: 'pending', reference: 'PAY5' } }),
++  });
++  const flow = createPaymentFlow({ ...base, maxPolls: 3, fetch: api.fetch });
++  await flow.start({ gateway: 'mpesa', productId: 1, msisdn: '5' });
++  await until(flow, STEPS.TIMEOUT);
++  flow.keepWaiting();
++  await until(flow, STEPS.TIMEOUT); // 3 more polls, still pending (n=4..6)
++  flow.keepWaiting();
++  await until(flow, STEPS.SUCCESS);
++});
++
++test('transient network errors while polling do not fail the payment', async () => {
++  let n = 0;
++  const api = mockApi({
++    'POST /charge': [{ body: { status: 'pending', action: 'poll', reference: 'PAY6' } }],
++    'GET /status/:ref': () => {
++      n++;
++      if (n === 1) return new Error('blip');
++      return { body: { status: 'completed', reference: 'PAY6' } };
++    },
++  });
++  const flow = createPaymentFlow({ ...base, fetch: api.fetch });
++  await flow.start({ gateway: 'ecocash', productId: 1, msisdn: '5' });
++  await until(flow, STEPS.SUCCESS);
++});
++
++test('reset() cancels an in-flight poll: a stale poll cannot revive the flow', async () => {
++  const api = mockApi({
++    'POST /charge': [{ body: { status: 'pending', action: 'poll', reference: 'PAY7' } }],
++    'GET /status/:ref': [{ body: { status: 'completed', reference: 'PAY7' } }],
++  });
++  const flow = createPaymentFlow({ ...base, pollInterval: 20, fetch: api.fetch });
++  await flow.start({ gateway: 'mpesa', productId: 1, msisdn: '5' });
++  flow.reset();
++  await wait(60);
++  assert.equal(flow.getState().step, STEPS.IDLE);
++  assert.equal(api.calls.length, 1);
++});
++
++test('resume(reference) after a redirect return polls immediately', async () => {
++  const api = mockApi({ 'GET /status/:ref': [{ body: { status: 'completed', reference: 'PAY8' } }] });
++  const flow = createPaymentFlow({ ...base, fetch: api.fetch });
++  flow.resume('PAY8');
++  await until(flow, STEPS.SUCCESS);
++  assert.equal(api.calls[0].path, '/api/payments/status/PAY8');
++});
++
++test('loadGateways stores the list and returns it', async () => {
++  const api = mockApi({ 'GET /gateways': [{ body: { data: [{ slug: 'mpesa', name: 'M-Pesa', driver: 'mpesa', currency: 'LSL', public: {} }] } }] });
++  const flow = createPaymentFlow({ fetch: api.fetch });
++  const list = await flow.loadGateways();
++  assert.equal(list[0].slug, 'mpesa');
++  assert.equal(flow.getState().gateways.length, 1);
++});
++
++test('subscribe emits immediately and on every change; unsubscribe stops it', async () => {
++  const api = mockApi({ 'POST /charge': [{ body: { status: 'completed', reference: 'PAY9' } }] });
++  const flow = createPaymentFlow({ fetch: api.fetch });
++  const steps = [];
++  const off = flow.subscribe((s) => steps.push(s.step));
++  await flow.start({ gateway: 'mpesa', productId: 1, msisdn: '5' });
++  off();
++  flow.reset();
++  assert.deepEqual(steps, ['idle', 'charging', 'success']);
++});
+diff --git a/tests-js/dialog.test.mjs b/tests-js/dialog.test.mjs
+new file mode 100644
+index 0000000..d5a76d1
+--- /dev/null
++++ b/tests-js/dialog.test.mjs
+@@ -0,0 +1,115 @@
++import { JSDOM } from 'jsdom';
++import assert from 'node:assert/strict';
++import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
++import { fileURLToPath, pathToFileURL } from 'node:url';
++const repo = fileURLToPath(new URL('..', import.meta.url));
++import { parse, compileScript, compileTemplate } from '@vue/compiler-sfc';
++
++const dom = new JSDOM('<!doctype html><div id="app"></div>', { pretendToBeVisual: true });
++for (const k of ['window', 'document', 'HTMLElement', 'Node', 'Element', 'SVGElement', 'Event', 'MouseEvent']) {
++  Object.defineProperty(globalThis, k, { value: dom.window[k] ?? dom.window, configurable: true, writable: true });
++}
++Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, configurable: true });
++
++// ---- compile the SFC to an ES module on the fly (no bundler) ----
++const file = repo + 'resources/js/vue/PaymentDialog.vue';
++const { descriptor } = parse(readFileSync(file, 'utf8'), { filename: file });
++const script = compileScript(descriptor, { id: 'pd', inlineTemplate: true, templateOptions: { compilerOptions: {} } });
++mkdirSync(repo + '.tmp-ui', { recursive: true });
++writeFileSync(repo + '.tmp-ui/PaymentDialog.compiled.js', script.content.replace("from './usePayment.js'", "from '../resources/js/vue/usePayment.js'"));
++const { default: PaymentDialog } = await import(pathToFileURL(repo + '.tmp-ui/PaymentDialog.compiled.js').href);
++const { createApp, h, nextTick, ref, defineComponent } = await import('vue');
++
++// ---- Quasar stubs ----
++const slotted = (tag = 'div') => defineComponent({ inheritAttrs: true, setup: (_, { slots }) => () => h(tag, slots.default?.()) });
++const stubs = {
++  QDialog: defineComponent({ props: ['modelValue'], setup: (p, { slots }) => () => (p.modelValue ? h('div', { class: 'dlg' }, slots.default?.()) : null) }),
++  QCard: slotted(), QCardSection: slotted(), QList: slotted(), QItem: defineComponent({ setup: (_, { slots }) => () => h('div', { class: 'item' }, slots.default?.()) }),
++  QItemSection: slotted('span'), QSpace: slotted('span'), QIcon: defineComponent({ props: ['name'], setup: (p) => () => h('i', { class: 'icon' }, p.name) }),
++  QSpinner: slotted('span'), QSpinnerDots: slotted('span'),
++  QRadio: defineComponent({ props: ['modelValue', 'val'], emits: ['update:modelValue'], setup: (p, { emit }) => () => h('input', { type: 'radio', value: p.val, checked: p.modelValue === p.val, onChange: () => emit('update:modelValue', p.val) }) }),
++  QBtn: defineComponent({ props: ['label', 'disable', 'loading'], setup: (p, { slots }) => () => h('button', { disabled: !!p.disable, class: 'btn' }, p.label ?? slots.default?.()) }),
++  QInput: defineComponent({ props: ['modelValue', 'label'], emits: ['update:modelValue'], setup: (p, { emit }) => () => h('input', { class: 'inp', placeholder: p.label, value: p.modelValue, onInput: (e) => emit('update:modelValue', e.target.value) }) }),
++};
++
++function mount(propsExtra = {}) {
++  const open = ref(true);
++  const events = [];
++  const root = document.getElementById('app');
++  root.innerHTML = '';
++  const app = createApp({ render: () => h(PaymentDialog, { modelValue: open.value, 'onUpdate:modelValue': (v) => (open.value = v), productIds: [12], pollInterval: 5, onSuccess: () => events.push('success'), onFailed: () => events.push('failed'), ...propsExtra }) });
++  Object.entries(stubs).forEach(([n, c]) => app.component(n, c));
++  app.directive('ripple', {});
++  app.mount(root);
++  return { root, open, events, text: () => root.textContent.replace(/\s+/g, ' ').trim() };
++}
++const wait = (ms) => new Promise((r) => setTimeout(r, ms));
++const until = async (fn, label) => { const end = Date.now() + 1500; while (!fn()) { if (Date.now() > end) assert.fail('timeout: ' + label); await wait(3); } };
++const setInput = async (el, v) => { el.value = v; el.dispatchEvent(new dom.window.Event('input')); await nextTick(); };
++const button = (root, label) => [...root.querySelectorAll('button')].find((b) => b.textContent.includes(label));
++
++const gateways = { data: [ { slug: 'mpesa', name: 'M-Pesa', driver: 'mpesa', currency: 'LSL', public: {} }, { slug: 'cpay', name: 'CPay', driver: 'cpay', currency: 'LSL', public: {} }, { slug: 'paypal', name: 'PayPal', driver: 'paypal', currency: 'USD', public: { client_id: 'x' } } ] };
++let charges = [], statusN = 0;
++globalThis.fetch = async (url, init) => {
++  const path = new URL(url, 'http://x').pathname.replace('/api/payments', '');
++  const body = init.body ? JSON.parse(init.body) : null;
++  const reply = (b, status = 200) => ({ ok: status < 400, status, json: async () => b });
++  if (path === '/gateways') return reply(gateways);
++  if (path === '/charge') { charges.push(body); return body.gateway === 'cpay' ? reply({ status: 'pending', action: 'otp', reference: 'R2', message: 'Enter the code we sent.' }) : reply({ status: 'pending', action: 'poll', reference: 'R1', message: 'Approve on your phone.' }); }
++  if (path.startsWith('/status/')) return reply({ status: ++statusN >= 3 ? 'completed' : 'pending', reference: 'R1' });
++  if (path === '/confirm') return reply({ status: 'completed', reference: 'R2' });
++  throw new Error('unmocked ' + path);
++};
++
++// 1. M-Pesa: pick gateway, type phone, pay, wait, success
++{
++  const ui = mount();
++  await until(() => ui.text().includes('M-Pesa'), 'gateways listed');
++  assert.ok(ui.text().includes('PayPal'));
++  assert.ok(button(ui.root, 'Choose a payment method').disabled, 'pay disabled until a method is chosen');
++
++  const radios = ui.root.querySelectorAll('input[type=radio]');
++  radios[0].dispatchEvent(new dom.window.Event('change')); await nextTick();
++  assert.ok(ui.text().includes('Pay with M-Pesa'));
++  assert.ok(button(ui.root, 'Pay with M-Pesa').disabled, 'disabled without a phone');
++
++  await setInput(ui.root.querySelector('input.inp'), '58123456');
++  const pay = button(ui.root, 'Pay with M-Pesa'); assert.equal(pay.disabled, false);
++  pay.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
++  await until(() => ui.text().includes('Approve on your phone'), 'polling view');
++  await until(() => ui.text().includes('Payment complete'), 'success view');
++  assert.deepEqual(charges[0], { gateway: 'mpesa', product_ids: [12], msisdn: '58123456' });
++  assert.deepEqual(ui.events, ['success']);
++
++  button(ui.root, 'Done').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
++  await nextTick();
++  assert.equal(ui.open.value, false, 'Done closes the dialog');
++  console.log('ok  M-Pesa flow: list -> phone -> polling -> success -> close');
++}
++
++// 2. CPay: OTP step
++{
++  charges = [];
++  const ui = mount();
++  await until(() => ui.text().includes('CPay'), 'gateways');
++  ui.root.querySelectorAll('input[type=radio]')[1].dispatchEvent(new dom.window.Event('change')); await nextTick();
++  await setInput(ui.root.querySelector('input.inp'), '58000000');
++  button(ui.root, 'Pay with CPay').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
++  await until(() => ui.text().includes('Enter the code we sent'), 'otp view');
++  await setInput(ui.root.querySelector('input.inp'), '654321');
++  button(ui.root, 'Confirm').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
++  await until(() => ui.text().includes('Payment complete'), 'success after otp');
++  console.log('ok  CPay flow: otp -> confirm -> success');
++}
++
++// 3. PayPal does not ask for a phone; gateways prop filters the list
++{
++  const ui = mount({ gateways: ['paypal'] });
++  await until(() => ui.text().includes('PayPal'), 'filtered list');
++  assert.ok(!ui.text().includes('M-Pesa'), 'filter hides other gateways');
++  assert.equal(ui.root.querySelectorAll('input.inp').length, 0, 'no phone input for paypal');
++  assert.ok(ui.text().includes('Pay with PayPal'), 'single gateway is preselected');
++  console.log('ok  gateway filter + paypal without phone + single gateway preselected');
++}
++console.log('\nUI checks passed');
++process.exit(0);
+diff --git a/tests/publisher.php b/tests/publisher.php
+new file mode 100644
+index 0000000..72ea25f
+--- /dev/null
++++ b/tests/publisher.php
+@@ -0,0 +1,59 @@
++<?php
++// Installer building blocks, stubs and config patch strings:  php tests/publisher.php
++require dirname(__DIR__).'/src/Support/StubPublisher.php';
++use Molefigog\Payments\Support\StubPublisher as P;
++$t=0;$f=0; function check($n,$g,$e){global $t,$f;$t++; if($g!==$e){$f++; echo "FAIL $n: ".var_export($g,true)." != ".var_export($e,true)."\n";}}
++$root=dirname(__DIR__); $tmp=sys_get_temp_dir().'/pubtest_'.getmypid(); mkdir($tmp);
++
++// 1. create with placeholder replacement
++$p=new P(false);
++check('create', $p->file("$root/stubs/Payment.stub","$tmp/app/Models/Payment.php",['rootNamespace'=>'App\\']), 'created');
++$c=file_get_contents("$tmp/app/Models/Payment.php");
++check('namespace filled', str_contains($c,'namespace App\\Models;'), true);
++check('no placeholder left', str_contains($c,'{{'), false);
++exec('php -l '.escapeshellarg("$tmp/app/Models/Payment.php").' 2>&1',$o,$rc); check('generated model lints', $rc, 0);
++
++// 2. never clobber user edits
++file_put_contents("$tmp/app/Models/Payment.php","<?php // mine");
++check('exists', $p->file("$root/stubs/Payment.stub","$tmp/app/Models/Payment.php",['rootNamespace'=>'App\\']), 'exists');
++check('user edit kept', file_get_contents("$tmp/app/Models/Payment.php"), "<?php // mine");
++// 3. force overwrites
++check('force', (new P(true))->file("$root/stubs/Payment.stub","$tmp/app/Models/Payment.php",['rootNamespace'=>'Acme\\']), 'overwritten');
++check('force content', str_contains(file_get_contents("$tmp/app/Models/Payment.php"),'namespace Acme\\Models;'), true);
++
++// 4. every stub generates valid PHP
++foreach (['Payment','PaymentGateway','HandlePaymentCompleted','AppProductResolver'] as $s) {
++  $dest="$tmp/gen/$s.php"; (new P)->file("$root/stubs/$s.stub",$dest,['rootNamespace'=>'App\\']);
++  $o=[]; exec('php -l '.escapeshellarg($dest).' 2>&1',$o,$rc); check("stub $s lints",$rc,0);
++}
++
++// 5. directory copy keeps structure, second run skips all
++$r1=(new P)->directory("$root/resources/js","$tmp/quasar/src/payments");
++check('dir files', array_map(fn($k)=>str_replace("$tmp/quasar/src/payments/",'',$k), array_keys($r1)), ['core/payments-core.js','vue/PaymentDialog.vue','vue/usePayment.js']);
++check('dir all created', array_unique(array_values($r1)), ['created']);
++check('vue import path intact', str_contains(file_get_contents("$tmp/quasar/src/payments/vue/usePayment.js"),"'../core/payments-core.js'"), true);
++check('rerun skips', array_unique(array_values((new P)->directory("$root/resources/js","$tmp/quasar/src/payments"))), ['exists']);
++
++// 6. path resolving (incl. Windows + relative-to-sibling)
++check('relative', P::resolvePath('resources/js/payments','/srv/app'), '/srv/app/resources/js/payments');
++check('sibling', P::resolvePath('../Musik-Frontend2/src/payments','/srv/app'), '/srv/app/../Musik-Frontend2/src/payments');
++check('win abs', P::resolvePath('C:\\Users\\Thato\\Desktop\\front\\src','/x'), 'C:\\Users\\Thato\\Desktop\\front\\src');
++check('win abs fwd', P::resolvePath('D:/code/front','/x'), 'D:/code/front');
++check('unix abs', P::resolvePath('/var/www/front','/x'), '/var/www/front');
++
++// 7. missing stub is a loud error
++try { (new P)->file("$root/stubs/Nope.stub","$tmp/x.php"); check('missing',true,false);} catch(InvalidArgumentException $e){ check('missing',true,true);}
++
++// 8. config patch strings exist verbatim in the real config, and the patched file still lints
++$cfg=file_get_contents("$root/config/payments.php");
++$ns='App\\';
++$pairs=[
++ ["'payment' => Molefigog\\Payments\\Models\\Payment::class,","'payment' => {$ns}Models\\Payment::class,"],
++ ["'gateway' => Molefigog\\Payments\\Models\\PaymentGateway::class,","'gateway' => {$ns}Models\\PaymentGateway::class,"],
++ ["'resolver' => null,","'resolver' => {$ns}Payments\\AppProductResolver::class,"],
++];
++foreach($pairs as [$a,$b]){ check("search present: $a", str_contains($cfg,$a), true); $cfg=str_replace($a,$b,$cfg); }
++file_put_contents("$tmp/patched.php",$cfg); exec('php -l '.escapeshellarg("$tmp/patched.php").' 2>&1',$o,$rc); check('patched config lints',$rc,0);
++
++exec('rm -rf '.escapeshellarg($tmp));
++echo "\n$t checks, $f failed\n";
+diff --git a/tests/smoke.php b/tests/smoke.php
+new file mode 100644
+index 0000000..af24697
+--- /dev/null
++++ b/tests/smoke.php
+@@ -0,0 +1,70 @@
++<?php
++// Pure-logic checks (no Laravel needed):  php tests/smoke.php
++spl_autoload_register(function ($c) {
++    $p = 'Molefigog\\Payments\\';
++    if (str_starts_with($c, $p)) { $f = dirname(__DIR__).'/src/'.str_replace('\\','/',substr($c,strlen($p))).'.php'; if (is_file($f)) require $f; }
++});
++$GLOBALS['cfg'] = ['payments.resolver'=>null,'payments.allowed_redirect_hosts'=>['gw-ent.co.za'],'payments.allowed_redirect_schemes'=>['com.streama.app'],'app.url'=>'https://api.gw-ent.co.za'];
++function config($k=null,$d=null){ return $GLOBALS['cfg'][$k] ?? $d; }
++
++use Molefigog\Payments\Support\{Msisdn,ChargeRequest,RedirectGuard};
++$t=0;$f=0;
++function check($name,$got,$exp){ global $t,$f; $t++; if($got!==$exp){$f++; echo "FAIL $name: got ".var_export($got,true)." expected ".var_export($exp,true)."\n";} }
++
++// Msisdn
++check('intl local',  Msisdn::format('58123456','international','266'),'26658123456');
++check('intl leading0',Msisdn::format('058123456','international','266'),'26658123456');
++check('intl already',Msisdn::format('+266 5812 3456','international','266'),'26658123456');
++check('local strip', Msisdn::format('26658123456','local','266'),'58123456');
++check('digits',      Msisdn::format('+266-5812-3456','digits'),'26658123456');
++check('raw',         Msisdn::format(' 58123456 ','raw'),'58123456');
++
++// ChargeRequest ids
++check('ids csv',   ChargeRequest::normalizeIds('5, 6,7'),['5','6','7']);
++check('ids array', ChargeRequest::normalizeIds([5,'5',6]),['5','6']);
++check('ids null',  ChargeRequest::normalizeIds(null),[]);
++check('ids int',   ChargeRequest::normalizeIds(12),['12']);
++$r = ChargeRequest::make('mpesa','1,2',['amount'=>'100.50','msisdn'=>'58123456','return_url'=>'https://x','email'=>'']);
++check('make amount',$r->amount,100.5); check('make options',$r->options,['return_url'=>'https://x']);
++
++// RedirectGuard
++check('rg ok host',  RedirectGuard::isAllowed('https://gw-ent.co.za/paypal/result'),true);
++check('rg app host', RedirectGuard::isAllowed('https://api.gw-ent.co.za/x'),true);
++check('rg evil',     RedirectGuard::isAllowed('https://evil.com/'),false);
++check('rg evil2',    RedirectGuard::isAllowed('https://gw-ent.co.za.evil.com/'),false);
++check('rg scheme',   RedirectGuard::isAllowed('com.streama.app://paypal-callback'),true);
++check('rg js',       RedirectGuard::isAllowed('javascript:alert(1)'),false);
++check('rg empty',    RedirectGuard::isAllowed(''),false);
++check('rg append',   RedirectGuard::append('https://a.com/r?x=1#h',['s'=>'ok']),'https://a.com/r?x=1&s=ok#h');
++
++// Amount split (no resolver) via reflection
++$svc = (new ReflectionClass(Molefigog\Payments\PaymentService::class))->newInstanceWithoutConstructor();
++$m = new ReflectionMethod($svc,'resolveLines'); $m->setAccessible(true);
++$lines = $m->invoke($svc, new ChargeRequest('mpesa',['1','2','3'],100.00,'5'));
++check('split sum', round(array_sum(array_column($lines,'amount')),2),100.0);
++check('split vals', array_column($lines,'amount'),[33.33,33.33,33.34]);
++$lines = $m->invoke($svc, new ChargeRequest('mpesa',[],50.0));
++check('no product', [$lines[0]['product_id'],$lines[0]['amount']],[null,50.0]);
++try { $m->invoke($svc, new ChargeRequest('mpesa',['1'],null)); check('needs amount',true,false);} catch (Molefigog\Payments\Exceptions\PaymentException $e){ check('needs amount',true,true);}
++
++// Resolver path: server price wins over client amount
++$GLOBALS['cfg']['payments.resolver'] = FakeResolver::class;
++class FakeResolver implements Molefigog\Payments\Contracts\ProductResolver {
++  public function resolve(array $ids,array $ctx=[]): array { return array_map(fn($i)=>new Molefigog\Payments\Support\Product($i,"Song $i",25.0,7),$ids); }
++}
++function app($c){ return new $c; }
++$lines = $m->invoke($svc, new ChargeRequest('mpesa',['9','10'],1.00));
++check('resolver ignores client amount', round(array_sum(array_column($lines,'amount')),2),50.0);
++check('resolver payee', $lines[0]['payee_id'],7);
++
++// M-Pesa key encryption round-trip
++$k = openssl_pkey_new(['private_key_bits'=>2048]); $det = openssl_pkey_get_details($k);
++$pem = $det['key']; $b64 = trim(preg_replace('/-----[A-Z ]+-----|\s+/','',$pem));
++foreach (['pem'=>$pem,'raw base64'=>$b64] as $label=>$key) {
++  $c = (new ReflectionClass(Molefigog\Payments\Gateways\MpesaClient::class))->newInstanceWithoutConstructor();
++  $p = new ReflectionProperty($c,'options'); $p->setAccessible(true); $p->setValue($c,['public_key'=>$key]);
++  $e = new ReflectionMethod($c,'encrypt'); $e->setAccessible(true);
++  $enc = $e->invoke($c,'session-123'); openssl_private_decrypt(base64_decode($enc),$dec,$k);
++  check("mpesa encrypt $label",$dec,'session-123');
++}
++echo "\n$t checks, $f failed\n";
+-- 
+2.43.0
+

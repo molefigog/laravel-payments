@@ -20,6 +20,7 @@ use Molefigog\Payments\Support\ChargeResult;
 use Molefigog\Payments\Support\GatewayResponse;
 use Molefigog\Payments\Support\RedirectGuard;
 use Throwable;
+use Molefigog\Payments\Support\Models;
 
 class PaymentService
 {
@@ -50,7 +51,7 @@ class PaymentService
         }
 
         $rows = DB::transaction(function () use ($lines, $request, $reference, $currency, $options) {
-            return collect($lines)->map(fn (array $line) => Payment::create([
+            return collect($lines)->map(fn (array $line) => Models::payment()::create([
                 'reference' => $reference,
                 'user_id' => $request->userId,
                 'product_id' => $line['product_id'],
@@ -184,7 +185,7 @@ class PaymentService
      */
     public function rows(string $idOrReference): Collection
     {
-        $first = Payment::query()
+        $first = Models::payment()::query()
             ->where('reference', $idOrReference)
             ->orWhere('txn_id', $idOrReference)
             ->orWhere('conversation_id', $idOrReference)
@@ -195,7 +196,7 @@ class PaymentService
             return collect();
         }
 
-        return Payment::query()->where('reference', $first->reference)->orderBy('id')->get();
+        return Models::payment()::query()->where('reference', $first->reference)->orderBy('id')->get();
     }
 
     /*
@@ -291,7 +292,7 @@ class PaymentService
     protected function apply(string $reference, GatewayResponse $response): array
     {
         return DB::transaction(function () use ($reference, $response) {
-            $rows = Payment::query()->where('reference', $reference)->orderBy('id')->lockForUpdate()->get();
+            $rows = Models::payment()::query()->where('reference', $reference)->orderBy('id')->lockForUpdate()->get();
 
             if ($rows->isEmpty()) {
                 return [$rows, null];
@@ -323,9 +324,9 @@ class PaymentService
                 $update['paid_at'] = now();
             }
 
-            Payment::query()->where('reference', $reference)->update($update);
+            Models::payment()::query()->where('reference', $reference)->update($update);
 
-            $fresh = Payment::query()->where('reference', $reference)->orderBy('id')->get();
+            $fresh = Models::payment()::query()->where('reference', $reference)->orderBy('id')->get();
 
             $transition = null;
             if ($new === 'completed') {

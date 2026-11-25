@@ -1,0 +1,28 @@
+<?php
+
+namespace {{ rootNamespace }}Payments;
+
+use Molefigog\Payments\Contracts\ProductResolver;
+use Molefigog\Payments\Support\Product;
+
+/**
+ * Looks products up on the SERVER, so a client can never choose its own price.
+ * Registered in config/payments.php ('resolver'). Returning no products makes every charge fail safely
+ * until you implement this.
+ */
+class AppProductResolver implements ProductResolver
+{
+    public function resolve(array $productIds, array $context = []): array
+    {
+        // Example:
+        //
+        // return \App\Models\Song::findMany($productIds)->map(fn ($song) => new Product(
+        //     id: $song->id,
+        //     title: $song->title,
+        //     amount: (float) $song->price,
+        //     payeeId: $song->user_id,      // optional: who gets paid (stored as payee_id)
+        // ))->all();
+
+        return [];
+    }
+}

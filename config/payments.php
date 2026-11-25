@@ -27,6 +27,13 @@ return [
         'gateways' => 'payment_gateways',
     ],
 
+    // Swap in your own models (they must extend the package ones). `php artisan payments:install`
+    // can create App\Models\Payment / PaymentGateway stubs for you.
+    'models' => [
+        'payment' => Molefigog\Payments\Models\Payment::class,
+        'gateway' => Molefigog\Payments\Models\PaymentGateway::class,
+    ],
+
     'routes' => [
         'enabled' => true,
         'prefix' => 'api/payments',

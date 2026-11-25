@@ -1,0 +1,24 @@
+<?php
+
+namespace {{ rootNamespace }}Listeners;
+
+use Molefigog\Payments\Events\PaymentCompleted;
+
+/**
+ * Runs once per successful charge, even if the provider retries its webhook.
+ * Laravel 11+ discovers this listener automatically; on older versions register it in EventServiceProvider.
+ * Add `implements ShouldQueue` to run it on the queue.
+ */
+class HandlePaymentCompleted
+{
+    public function handle(PaymentCompleted $event): void
+    {
+        foreach ($event->payments as $payment) {
+            // One row per product:
+            //   $payment->product_id, $payment->amount, $payment->payee_id (seller),
+            //   $payment->user_id, $payment->gateway, $payment->reference
+            //
+            // e.g. credit the seller, unlock the download, create the task, send the invoice ...
+        }
+    }
+}

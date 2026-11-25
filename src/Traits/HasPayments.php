@@ -7,13 +7,14 @@ use Molefigog\Payments\Models\Payment;
 use Molefigog\Payments\PaymentService;
 use Molefigog\Payments\Support\ChargeRequest;
 use Molefigog\Payments\Support\ChargeResult;
+use Molefigog\Payments\Support\Models;
 
 /** Add to your User model: `use HasPayments;` then `$user->charge(...)`. */
 trait HasPayments
 {
     public function payments(): HasMany
     {
-        return $this->hasMany(Payment::class, 'user_id');
+        return $this->hasMany(Models::payment(), 'user_id');
     }
 
     /**

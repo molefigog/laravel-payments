@@ -9,6 +9,7 @@ use Molefigog\Payments\Contracts\PaymentGateway;
 use Molefigog\Payments\Exceptions\PaymentException;
 use Molefigog\Payments\Models\PaymentGateway as GatewayModel;
 use Throwable;
+use Molefigog\Payments\Support\Models;
 
 class GatewayManager
 {
@@ -62,7 +63,7 @@ class GatewayManager
         $slugs = collect(array_keys((array) config('payments.gateways', [])));
 
         try {
-            $slugs = $slugs->merge(GatewayModel::query()->pluck('slug'));
+            $slugs = $slugs->merge(Models::gateway()::query()->pluck('slug'));
         } catch (Throwable) {
             // table not migrated yet: config only
         }
@@ -111,7 +112,7 @@ class GatewayManager
     protected function row(string $slug): ?GatewayModel
     {
         try {
-            return GatewayModel::query()->where('slug', $slug)->first();
+            return Models::gateway()::query()->where('slug', $slug)->first();
         } catch (Throwable) {
             return null;
         }

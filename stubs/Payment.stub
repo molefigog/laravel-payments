@@ -1,0 +1,18 @@
+<?php
+
+namespace {{ rootNamespace }}Models;
+
+use Molefigog\Payments\Models\Payment as BasePayment;
+
+/**
+ * Your Payment model. It extends the package model, so package updates still reach you,
+ * and you can add relations, scopes and casts here. Registered in config/payments.php ('models').
+ */
+class Payment extends BasePayment
+{
+    // Example: link a payment to your own product model (product_id is a plain string column).
+    // public function product()
+    // {
+    //     return $this->belongsTo(Product::class, 'product_id');
+    // }
+}
